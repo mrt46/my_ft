@@ -2017,11 +2017,30 @@ class Telegram(RPCHandler):
 
         grid_file = _Path(__file__).parents[4] / "data" / "final_grid.json"
         try:
-            if not grid_file.exists():
-                await self._send_msg(
-                    "*Grid:* `final_grid.json bulunamadi. Grid analizi henuz calistirilmadi.`",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
+            if not grid_file.exists() or not grid_file.stat().st_size:
+                # Grid file missing — show open trades as fallback
+                open_trades = Trade.get_trades_proxy(is_open=True)
+                stake_cur = self._config.get("stake_currency", "USDC")
+                if not open_trades:
+                    await self._send_msg(
+                        "*Grid:* `final_grid.json bulunamadi ve acik pozisyon yok.\n"
+                        "Grid analizi icin: python -m custom_modules.grid_analyzer`",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                    return
+                lines = [
+                    "*GRID DURUMU* (final\\_grid.json yok — canli pozisyonlar)",
+                    "```",
+                ]
+                for t in open_trades:
+                    profit = t.calc_profit_ratio(t.open_rate)
+                    lines.append(
+                        f"{t.pair}: {profit*100:+.2f}% | {t.stake_amount:.2f} {stake_cur} | "
+                        f"Giris: {t.open_rate:.4f}"
+                    )
+                lines.append("```")
+                lines.append("_Grid analizi henuz calistirilmadi. /report ile detay gorun._")
+                await self._send_msg("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
                 return
 
             data = _json.loads(grid_file.read_text(encoding="utf-8"))
@@ -2062,15 +2081,15 @@ class Telegram(RPCHandler):
     async def _cmd_pnl(self, update: Update, context: CallbackContext) -> None:
         """
         Handler for /pnl
-        Shows P&L breakdown: today, this week, all-time.
-        Delegates to the existing _profit_handler with today's data.
+        Shows P&L breakdown: today and all-time.
+        Uses _rpc_trade_statistics for accurate data.
         """
         try:
             stake_cur = self._config["stake_currency"]
             fiat_disp_cur = self._config.get("fiat_display_currency", "")
-            from datetime import date as _date, timedelta as _timedelta
+            from datetime import date as _date
 
-            # Today stats
+            # Today stats (closed trades only, from midnight)
             today_start = datetime.combine(_date.today(), datetime.min.time())
             stats_today = self._rpc._rpc_trade_statistics(
                 stake_currency=stake_cur,
@@ -2084,25 +2103,37 @@ class Telegram(RPCHandler):
                 start_date=datetime.fromtimestamp(0),
             )
 
+            # Today
             profit_today = stats_today.get("profit_closed_coin", 0.0)
-            profit_today_pct = stats_today.get("profit_factor", 0.0)
-            trades_today = stats_today.get("trade_count", 0)
+            profit_today_pct = stats_today.get("profit_closed_percent", 0.0)
+            closed_today = stats_today.get("closed_trade_count", 0)
 
+            # All-time
             profit_all = stats_all.get("profit_closed_coin", 0.0)
-            trades_all = stats_all.get("trade_count", 0)
-            win_rate = stats_all.get("winning_trades", 0)
-            loss_rate = stats_all.get("losing_trades", 0)
-            best_pair = stats_all.get("best_pair", {})
+            profit_all_pct = stats_all.get("profit_closed_percent", 0.0)
+            closed_all = stats_all.get("closed_trade_count", 0)
+            open_all = stats_all.get("trade_count", 0) - closed_all
+            win_count = stats_all.get("winning_trades", 0)
+            loss_count = stats_all.get("losing_trades", 0)
+            best_pair_name = stats_all.get("best_pair", "")
+            best_pair_pct = stats_all.get("best_rate", 0.0)
+            win_rate_pct = (win_count / closed_all * 100) if closed_all > 0 else 0.0
 
             msg = (
                 f"*P&L RAPORU*\n"
                 f"```\n"
-                f"Bugun  : {profit_today:+.4f} {stake_cur} ({trades_today} islem)\n"
-                f"Toplam : {profit_all:+.4f} {stake_cur} ({trades_all} islem)\n"
-                f"Kazanan: {win_rate}  Kaybeden: {loss_rate}\n"
+                f"BUGUN\n"
+                f"  Kapali islem : {closed_today}\n"
+                f"  Kar/Zarar   : {profit_today:+.4f} {stake_cur} ({profit_today_pct:+.2f}%)\n"
+                f"\n"
+                f"TUM ZAMANLAR\n"
+                f"  Acik islem  : {open_all}\n"
+                f"  Kapali islem: {closed_all}\n"
+                f"  Kar/Zarar   : {profit_all:+.4f} {stake_cur} ({profit_all_pct:+.2f}%)\n"
+                f"  Kazanma oran: {win_rate_pct:.1f}% ({win_count}K / {loss_count}K)\n"
             )
-            if best_pair:
-                msg += f"En iyi : {best_pair.get('key', '?')} {best_pair.get('profit_sum_pct', 0):.2f}%\n"
+            if best_pair_name:
+                msg += f"  En iyi pair : {best_pair_name} ({best_pair_pct:+.2f}%)\n"
             msg += "```"
             await self._send_msg(msg, parse_mode=ParseMode.MARKDOWN)
         except Exception as exc:
@@ -2246,21 +2277,29 @@ class Telegram(RPCHandler):
                 start_date=datetime.fromtimestamp(0),
             )
             profit_all = stats.get("profit_closed_coin", 0.0)
-            trades_all = stats.get("trade_count", 0)
+            profit_all_pct = stats.get("profit_closed_percent", 0.0)
+            closed_all = stats.get("closed_trade_count", 0)
+            win_count = stats.get("winning_trades", 0)
+            loss_count = stats.get("losing_trades", 0)
 
             # Grid summary
             grid_file = _Path(__file__).parents[4] / "data" / "final_grid.json"
             grid_pairs = []
+            grid_status = "Grid analizi henuz calistirilmadi"
             if grid_file.exists():
-                gdata = _json.loads(grid_file.read_text(encoding="utf-8"))
-                grid_pairs = list(gdata.keys())
+                try:
+                    gdata = _json.loads(grid_file.read_text(encoding="utf-8"))
+                    grid_pairs = list(gdata.keys())
+                    grid_status = f"{len(grid_pairs)} pair yuklendi"
+                except Exception:
+                    grid_status = "Grid dosyasi okunamadi"
 
             lines = [
                 f"*BOT DURUM RAPORU*",
                 f"```",
-                f"Mod    : {mode}",
-                f"Strateji: DynamicGridStrategy",
-                f"Zaman  : {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}",
+                f"Mod      : {mode}",
+                f"Strateji : DynamicGridStrategy",
+                f"Zaman    : {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}",
                 f"",
                 f"ACIK POZISYONLAR ({len(open_trades)} adet):",
             ]
@@ -2272,13 +2311,16 @@ class Telegram(RPCHandler):
             lines += [
                 f"",
                 f"P&L OZETI:",
-                f"  Toplam kapali islem: {trades_all}",
-                f"  Toplam kar/zarar: {profit_all:+.4f} {stake_cur}",
+                f"  Kapali islem : {closed_all}",
+                f"  Kar/Zarar   : {profit_all:+.4f} {stake_cur} ({profit_all_pct:+.2f}%)",
+                f"  Kazanan/Kaybeden: {win_count} / {loss_count}",
                 f"",
-                f"GRID DOSYASI:",
-                f"  Yuklenen coinler: {', '.join(grid_pairs) if grid_pairs else 'Yok'}",
-                f"```",
+                f"GRID DURUMU:",
+                f"  {grid_status}",
             ]
+            if grid_pairs:
+                lines.append(f"  Coinler: {', '.join(grid_pairs)}")
+            lines.append(f"```")
             await self._send_msg("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
         except Exception as exc:
             logger.error("_cmd_report error: %s", exc)
