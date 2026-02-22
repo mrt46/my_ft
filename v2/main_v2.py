@@ -72,7 +72,6 @@ from custom_modules.hybrid_exit import HybridExitManager
 from custom_modules.news_fetcher import NewsFetcher
 from custom_modules.telegram_bot import (
     TelegramBotApp,
-    send_alert_sync,
     send_daily_report,
 )
 from grid_engine import GridEngine
@@ -378,7 +377,7 @@ class BotOrchestratorV2:
                 stats = self.grid_engine.get_stats()
                 await send_daily_report({
                     "daily_pnl":      stats.get("total_pnl_usdc", 0),
-                    "daily_pnl_pct":  stats.get("total_pnl_usdc", 0) / self.capital._total_usdc * 100,
+                    "daily_pnl_pct":  stats.get("total_pnl_usdc", 0) / (snap["total"] or 1) * 100,
                     "weekly_pnl":     0,
                     "monthly_pnl":    0,
                     "total_pnl":      stats.get("total_pnl_usdc", 0),

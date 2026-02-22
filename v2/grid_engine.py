@@ -22,7 +22,6 @@ Mevcut modülleri değiştirmez:
 import asyncio
 import json
 import logging
-import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
