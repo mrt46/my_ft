@@ -163,9 +163,14 @@ class SentimentAnalyzer:
         self._deepseek_key = os.getenv("DEEPSEEK_API_KEY", "")
         self._gemini_key = os.getenv("GEMINI_API_KEY", "")
 
+        # Telegram (fire-and-forget via bot API)
+        self._tg_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        self._tg_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
+
         logger.info(
-            "SentimentAnalyzer initialised — prompt=%s, timeout=%ds, min_conf=%.1f",
+            "SentimentAnalyzer initialised — prompt=%s, timeout=%ds, min_conf=%.1f, tg=%s",
             self._prompt_version, self._timeout, self._min_confidence,
+            "enabled" if self._tg_token else "disabled",
         )
 
     # ------------------------------------------------------------------
@@ -177,6 +182,7 @@ class SentimentAnalyzer:
         news_batch: list[str],
         coin: str,
         hours: int | None = None,
+        _send_telegram: bool = True,
     ) -> SentimentResult:
         """Fetch and aggregate sentiment from all 3 LLMs.
 
@@ -232,7 +238,7 @@ class SentimentAnalyzer:
             scores.append(result)
             individual[provider] = result
 
-        return self._aggregate(coin, scores, individual, news_count=news_count)
+        return self._aggregate(coin, scores, individual, news_count=news_count, send_telegram=_send_telegram)
 
     def get_sentiment_sync(self, news_batch: list[str], coin: str) -> SentimentResult:
         """Synchronous wrapper around ``get_sentiment``.
@@ -456,6 +462,7 @@ class SentimentAnalyzer:
         scores: list[LLMScore],
         individual: dict[str, LLMScore],
         news_count: int = 0,
+        send_telegram: bool = False,
     ) -> SentimentResult:
         """Compute weighted average and consensus metrics.
 
@@ -472,6 +479,11 @@ class SentimentAnalyzer:
             logger.error(f"All LLMs failed for {coin}")
             result = self._empty_result(coin, individual, news_count)
             self._log_sentiment(result)
+            if send_telegram:
+                self._send_telegram_sync(
+                    f"SENTIMENT HATA: {coin}\n"
+                    f"Tum LLM'ler basarisiz oldu. Sentiment uygulanmayacak."
+                )
             return result
 
         if len(scores) < self._min_llms:
@@ -515,7 +527,199 @@ class SentimentAnalyzer:
             coin, sentiment, mean_confidence, agreement, usable,
             len(scores), 3, news_count, self._prompt_version,
         )
+        # Send individual coin result to Telegram (only when called directly, not via _get_all_async)
+        if send_telegram:
+            detail_msg = self._format_single_telegram(result)
+            self._send_telegram_sync(detail_msg)
         return result
+
+    # ------------------------------------------------------------------
+    # Telegram notifications
+    # ------------------------------------------------------------------
+
+    def _sentiment_emoji(self, score: float) -> str:
+        """Return emoji representing sentiment strength."""
+        if score >= 0.6:
+            return "🟢🟢"
+        elif score >= 0.3:
+            return "🟢"
+        elif score >= 0.1:
+            return "🟡"
+        elif score > -0.1:
+            return "⚪"
+        elif score > -0.3:
+            return "🟠"
+        elif score > -0.6:
+            return "🔴"
+        else:
+            return "🔴🔴"
+
+    def _format_single_telegram(self, result: SentimentResult) -> str:
+        """Format a single coin sentiment result for Telegram.
+
+        Args:
+            result: SentimentResult to format.
+
+        Returns:
+            Plain-text message string (no Markdown special chars).
+        """
+        coin = result["coin"]
+        score = result["sentiment"]
+        conf = result["confidence"]
+        agree = result["agreement"]
+        usable = result["usable"]
+        news_count = result.get("news_count", 0)
+        individual = result.get("individual_scores", {})
+
+        emoji = self._sentiment_emoji(score)
+        usable_tag = "KULLANILABILIR" if usable else "DUSUK GUVEN"
+
+        # Individual LLM scores
+        llm_lines = []
+        for provider, sc in individual.items():
+            s = sc.get("sentiment", 0.0)
+            c = sc.get("confidence", 0.0)
+            llm_lines.append(f"  {provider:8s}: {s:+.2f} (conf={c:.2f})")
+
+        # Key events from first available LLM
+        key_events: list[str] = []
+        risk_factors: list[str] = []
+        for sc in individual.values():
+            if sc.get("key_events"):
+                key_events = sc["key_events"][:2]
+            if sc.get("risk_factors"):
+                risk_factors = sc["risk_factors"][:2]
+            if key_events:
+                break
+
+        lines = [
+            f"{emoji} SENTIMENT: {coin}",
+            f"========================",
+            f"Skor    : {score:+.3f}  [{usable_tag}]",
+            f"Guven   : {conf:.2f}  Uzlasma: {agree:.2f}",
+            f"Haberler: {news_count} adet  Prompt: {result.get('prompt_version','v1')}",
+            f"",
+            f"LLM Skorlari:",
+        ]
+        lines.extend(llm_lines)
+
+        if key_events:
+            lines.append("")
+            lines.append("Onemli Olaylar:")
+            for ev in key_events:
+                lines.append(f"  + {ev[:80]}")
+
+        if risk_factors:
+            lines.append("")
+            lines.append("Risk Faktorleri:")
+            for rf in risk_factors:
+                lines.append(f"  - {rf[:80]}")
+
+        # Reasoning from first LLM
+        for sc in individual.values():
+            reasoning = sc.get("reasoning", "")
+            if reasoning:
+                lines.append("")
+                lines.append(f"Analiz: {reasoning[:200]}")
+                break
+
+        lines.append(f"========================")
+        lines.append(datetime.now(timezone.utc).strftime("%H:%M UTC"))
+        return "\n".join(lines)
+
+    def _format_summary_telegram(self, results: dict[str, SentimentResult]) -> str:
+        """Format a multi-coin sentiment summary for Telegram.
+
+        Args:
+            results: Mapping of coin → SentimentResult.
+
+        Returns:
+            Plain-text summary message.
+        """
+        lines = [
+            f"SENTIMENT ANALIZ OZETI",
+            f"========================",
+            f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+            f"Analiz edilen: {len(results)} coin",
+            f"",
+        ]
+
+        # Sort by sentiment score descending
+        sorted_results = sorted(
+            results.items(),
+            key=lambda x: x[1].get("sentiment", 0.0),
+            reverse=True,
+        )
+
+        for coin, r in sorted_results:
+            score = r.get("sentiment", 0.0)
+            conf = r.get("confidence", 0.0)
+            usable = r.get("usable", False)
+            emoji = self._sentiment_emoji(score)
+            usable_tag = "ok" if usable else "!"
+            lines.append(
+                f"{emoji} {coin:8s}: {score:+.3f}  conf={conf:.2f}  [{usable_tag}]"
+            )
+
+        # Overall market mood
+        usable_scores = [
+            r["sentiment"] for r in results.values() if r.get("usable", False)
+        ]
+        if usable_scores:
+            avg = sum(usable_scores) / len(usable_scores)
+            mood_emoji = self._sentiment_emoji(avg)
+            lines.append("")
+            lines.append(f"Genel Piyasa: {mood_emoji} {avg:+.3f}")
+
+        lines.append(f"========================")
+        return "\n".join(lines)
+
+    async def _send_telegram(self, message: str) -> None:
+        """Send a message to Telegram via Bot API (fire-and-forget).
+
+        Uses aiohttp directly to avoid dependency on telegram-bot library.
+        Silently skips if token/chat_id not configured.
+
+        Args:
+            message: Plain-text message to send.
+        """
+        if not self._tg_token or not self._tg_chat_id:
+            logger.debug("[TG] Telegram not configured — skipping sentiment notification")
+            return
+
+        try:
+            import aiohttp
+            url = f"https://api.telegram.org/bot{self._tg_token}/sendMessage"
+            payload = {
+                "chat_id": self._tg_chat_id,
+                "text": message,
+                "parse_mode": "",  # plain text — no markdown parsing
+            }
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.warning("[TG] Telegram send failed: HTTP %d — %s", resp.status, body[:100])
+                    else:
+                        logger.debug("[TG] Sentiment notification sent")
+        except Exception as exc:
+            logger.warning("[TG] Failed to send sentiment to Telegram: %s", exc)
+
+    def _send_telegram_sync(self, message: str) -> None:
+        """Synchronous wrapper for _send_telegram.
+
+        Safe to call from worker threads. Creates a temporary event loop.
+
+        Args:
+            message: Plain-text message to send.
+        """
+        try:
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(self._send_telegram(message))
+            loop.close()
+        except Exception as exc:
+            logger.warning("[TG] _send_telegram_sync failed: %s", exc)
 
     def _empty_result(self, coin: str, individual: dict, news_count: int = 0) -> SentimentResult:
         return {
@@ -535,15 +739,29 @@ class SentimentAnalyzer:
     # ------------------------------------------------------------------
 
     async def _get_all_async(self, news_map: dict[str, list[str]]) -> dict[str, SentimentResult]:
-        tasks = {coin: self.get_sentiment(news, coin) for coin, news in news_map.items()}
-        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-        return {
+        # _send_telegram=False: individual results suppressed; summary sent below
+        tasks = {coin: self.get_sentiment(news, coin, _send_telegram=False) for coin, news in news_map.items()}
+        raw_results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+        final: dict[str, SentimentResult] = {
             coin: (
                 r if not isinstance(r, Exception)
                 else self._empty_result(coin, {}, news_count=len(news_map.get(coin, [])))
             )
-            for coin, r in zip(tasks.keys(), results)
+            for coin, r in zip(tasks.keys(), raw_results)
         }
+
+        # Send summary report to Telegram after all coins are analysed
+        if len(final) > 1:
+            summary_msg = self._format_summary_telegram(final)
+            await self._send_telegram(summary_msg)
+        elif len(final) == 1:
+            # Single coin — send detailed report
+            result = next(iter(final.values()))
+            detail_msg = self._format_single_telegram(result)
+            await self._send_telegram(detail_msg)
+
+        return final
 
     def _log_sentiment(self, result: SentimentResult) -> None:
         """Append a sentiment result to logs/sentiment_YYYYMMDD.jsonl.
