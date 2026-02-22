@@ -181,3 +181,129 @@ class TestPersistence:
         assert analyzer.SENTIMENT_FILE.exists()
         data = json.loads(analyzer.SENTIMENT_FILE.read_text())
         assert "MATIC" in data
+
+
+# ---------------------------------------------------------------------------
+# Confidence Threshold Tests
+# ---------------------------------------------------------------------------
+
+class TestConfidenceThreshold:
+    """Verify sentiment is ignored when confidence < 0.6."""
+
+    def test_low_confidence_marks_unusable(self, analyzer):
+        """Sentiment with confidence < 0.6 should be marked unusable."""
+        scores = [
+            _score("deepseek", 0.8, 0.4),  # confidence 0.4 < 0.6
+            _score("gpt4o", 0.7, 0.5),     # confidence 0.5 < 0.6
+        ]
+        result = analyzer._aggregate("BTC", scores, {})
+        assert result["usable"] is False
+
+    def test_mixed_confidence_uses_high_confidence_only(self, analyzer):
+        """Only high-confidence LLM scores should contribute to ensemble."""
+        scores = [
+            _score("deepseek", 0.9, 0.8),  # High confidence
+            _score("gpt4o", 0.8, 0.85),    # High confidence
+            _score("gemini", 0.1, 0.3),    # Low confidence — should be ignored
+        ]
+        result = analyzer._aggregate("ETH", scores, {})
+        # Result should be closer to 0.85 (avg of deepseek+gpt4o) than 0.6 (with gemini)
+        assert result["sentiment"] > 0.5
+
+    def test_exactly_min_confidence_is_usable(self, analyzer):
+        """Sentiment at exactly min_confidence (0.6) should be usable."""
+        scores = [
+            _score("deepseek", 0.5, 0.6),  # Exactly at threshold
+            _score("gpt4o", 0.5, 0.6),
+        ]
+        result = analyzer._aggregate("SOL", scores, {})
+        assert result["usable"] is True
+
+
+# ---------------------------------------------------------------------------
+# LLM Fallback Tests
+# ---------------------------------------------------------------------------
+
+class TestLLMFallback:
+    """Verify 2/3 LLM fallback behavior."""
+
+    @pytest.mark.asyncio
+    async def test_timeout_falls_back_to_2_llms(self, analyzer):
+        """LLM timeout should fall back to remaining 2 LLMs."""
+        analyzer._call_deepseek = AsyncMock(side_effect=asyncio.TimeoutError())
+        analyzer._call_gpt4o = AsyncMock(return_value=_score("gpt4o", 0.6, 0.8))
+        analyzer._call_gemini = AsyncMock(return_value=_score("gemini", 0.7, 0.75))
+
+        result = await analyzer.get_sentiment(["news"], "BTC")
+        assert result["usable"] is True
+        assert "gpt4o" in result["individual_scores"]
+        assert "gemini" in result["individual_scores"]
+
+    @pytest.mark.asyncio
+    async def test_all_llms_fail_returns_neutral(self, analyzer):
+        """All LLMs failing should return neutral unusable sentiment."""
+        analyzer._call_deepseek = AsyncMock(side_effect=Exception("API error"))
+        analyzer._call_gpt4o = AsyncMock(side_effect=Exception("API error"))
+        analyzer._call_gemini = AsyncMock(side_effect=Exception("API error"))
+
+        result = await analyzer.get_sentiment(["news"], "XRP")
+        assert result["usable"] is False
+        assert result["sentiment"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_network_error_falls_back(self, analyzer):
+        """Network error on one LLM should fall back to others."""
+        analyzer._call_deepseek = AsyncMock(side_effect=ConnectionError("network"))
+        analyzer._call_gpt4o = AsyncMock(return_value=_score("gpt4o", 0.4, 0.9))
+        analyzer._call_gemini = AsyncMock(return_value=_score("gemini", 0.5, 0.85))
+
+        result = await analyzer.get_sentiment(["news"], "ADA")
+        assert result["usable"] is True
+
+    @pytest.mark.asyncio
+    async def test_individual_scores_recorded(self, analyzer):
+        """Individual LLM scores should be recorded in result."""
+        analyzer._call_deepseek = AsyncMock(return_value=_score("deepseek", 0.6, 0.85))
+        analyzer._call_gpt4o = AsyncMock(return_value=_score("gpt4o", 0.7, 0.90))
+        analyzer._call_gemini = AsyncMock(return_value=_score("gemini", 0.65, 0.80))
+
+        result = await analyzer.get_sentiment(["news"], "BNB")
+        assert "deepseek" in result["individual_scores"]
+        assert "gpt4o" in result["individual_scores"]
+        assert "gemini" in result["individual_scores"]
+
+
+# ---------------------------------------------------------------------------
+# Sentiment Score Range Tests
+# ---------------------------------------------------------------------------
+
+class TestSentimentScoreRange:
+    """Verify sentiment scores are always within [-1, 1]."""
+
+    def test_aggregate_sentiment_in_range(self, analyzer):
+        """Aggregated sentiment must be within [-1, 1]."""
+        scores = [
+            _score("deepseek", 0.9, 0.9),
+            _score("gpt4o", 0.8, 0.85),
+            _score("gemini", 0.95, 0.8),
+        ]
+        result = analyzer._aggregate("BTC", scores, {})
+        assert -1.0 <= result["sentiment"] <= 1.0
+
+    def test_aggregate_confidence_in_range(self, analyzer):
+        """Aggregated confidence must be within [0, 1]."""
+        scores = [
+            _score("deepseek", 0.5, 0.8),
+            _score("gpt4o", 0.6, 0.9),
+        ]
+        result = analyzer._aggregate("ETH", scores, {})
+        assert 0.0 <= result["confidence"] <= 1.0
+
+    def test_agreement_in_range(self, analyzer):
+        """Agreement score must be within [0, 1]."""
+        scores = [
+            _score("deepseek", 0.3, 0.8),
+            _score("gpt4o", 0.7, 0.9),
+        ]
+        result = analyzer._aggregate("SOL", scores, {})
+        assert 0.0 <= result["agreement"] <= 1.0

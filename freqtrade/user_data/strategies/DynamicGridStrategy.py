@@ -7,7 +7,10 @@ Grid logic:
     - Entry:  Price drops to a grid support level (within 0.5%)
     - Exit:   Price rises to the next grid level above avg entry (custom_exit)
     - DCA:    Position is added at each lower grid level (adjust_trade_position)
-    - Backup: minimal_roi and stoploss as safety net
+    - Backup: minimal_roi (3%) and stoploss (-12%) as safety net
+
+Profit target: NET %3 per trade (minimal_roi: {"0": 0.03})
+Telegram:      dp.send_msg() — requires allow_custom_messages: true in config.json
 
 File location assumed: freqtrade/user_data/strategies/DynamicGridStrategy.py
 Grid file:             my_ft/data/final_grid.json  (4 directories up)
@@ -34,6 +37,9 @@ FINAL_GRID_FILE = Path(__file__).parents[3] / "data" / "final_grid.json"
 # How close (%) to a grid level triggers a signal
 PROXIMITY_PCT = 0.005  # 0.5%
 
+# Minimum profit before grid TP exit is considered (1% — aligned with 3% daily target)
+MIN_PROFIT_FOR_EXIT = 0.01
+
 
 class DynamicGridStrategy(IStrategy):
     """Grid trading strategy driven by AI-fused support/resistance levels.
@@ -45,6 +51,9 @@ class DynamicGridStrategy(IStrategy):
         1. Buys when price drops to a grid support level
         2. Adds to the position at each lower grid level (DCA)
         3. Exits when price rises to the next level above avg entry
+
+    Profit target: %3 net per trade (minimal_roi safety net + custom_exit grid TP)
+    Telegram:      Startup grid summary, TP exits, DCA entries via dp.send_msg()
     """
 
     INTERFACE_VERSION = 3
@@ -53,12 +62,12 @@ class DynamicGridStrategy(IStrategy):
     position_adjustment_enable = True
     max_entry_position_adjustment = 8  # max 9 total entries per pair
 
-    # Target ROI — 3% per trade (daily_profit_target_pct: 3.0 in settings.yaml)
+    # Target ROI — NET %3 per trade (daily_profit_target_pct: 3.0 in settings.yaml)
     # custom_exit handles grid take-profits; minimal_roi is the safety net
     minimal_roi = {
-        "0": 0.03,      # 3% — günlük kar hedefi
-        "1440": 0.02,   # 2% — 1 günden sonra
-        "2880": 0.01,   # 1% — 2 günden sonra
+        "0": 0.03,      # %3 — günlük kar hedefi (net)
+        "1440": 0.02,   # %2 — 1 günden sonra
+        "2880": 0.01,   # %1 — 2 günden sonra
     }
 
     # Fallback stop-loss (below lowest expected grid level)
@@ -80,10 +89,32 @@ class DynamicGridStrategy(IStrategy):
     # Track which pairs we've already sent grid notifications for (avoid spam)
     _grid_notified: set = set()
 
-    def _send_grid_telegram(self, pair: str, levels: list[float], current_rate: float) -> None:
-        """Send grid levels for a pair to Telegram via Freqtrade's dp.send_msg().
+    # Track startup notification (sent once per bot start)
+    _startup_notified: bool = False
 
-        Called once per pair when grid levels are first loaded.
+    # -------------------------------------------------------------------------
+    # Telegram helpers
+    # -------------------------------------------------------------------------
+
+    def _dp_send(self, msg: str, always_send: bool = True) -> None:
+        """Send a message via Freqtrade's dp.send_msg() (requires allow_custom_messages: true).
+
+        Args:
+            msg: Plain-text message (no HTML — dp.send_msg uses plain text).
+            always_send: If True, bypasses dedup cache. Default True for trade events.
+        """
+        try:
+            if hasattr(self, "dp") and self.dp:
+                self.dp.send_msg(msg, always_send=always_send)
+            else:
+                logger.warning("[TG] DataProvider not available, cannot send message")
+        except Exception as exc:
+            logger.error("[TG] dp.send_msg failed: %s", exc)
+
+    def _send_grid_telegram(self, pair: str, levels: list[float], current_rate: float) -> None:
+        """Send grid levels for a pair to Telegram on first load.
+
+        Called once per pair when grid levels are first loaded or refreshed.
         Requires allow_custom_messages: true in config.json telegram section.
         """
         try:
@@ -104,43 +135,72 @@ class DynamicGridStrategy(IStrategy):
             levels_str = ""
             for lvl in sorted(levels):
                 if nearest_support and abs(lvl - nearest_support) < 0.0001:
-                    levels_str += f"  ▶ ${lvl:,.4f}  ← destek\n"
+                    levels_str += f"  >> ${lvl:,.4f}  <- destek\n"
                 elif nearest_resist and abs(lvl - nearest_resist) < 0.0001:
-                    levels_str += f"  ▶ ${lvl:,.4f}  ← hedef\n"
+                    levels_str += f"  >> ${lvl:,.4f}  <- hedef\n"
                 else:
-                    levels_str += f"  • ${lvl:,.4f}\n"
+                    levels_str += f"  . ${lvl:,.4f}\n"
 
             sentiment_line = ""
             if sentiment_score is not None:
-                s_emoji = "🟢" if sentiment_score > 0.1 else ("🔴" if sentiment_score < -0.1 else "🟡")
-                sentiment_line = f"\n{s_emoji} Sentiment: {sentiment_score:+.2f}"
+                s_emoji = "+" if sentiment_score > 0.1 else ("-" if sentiment_score < -0.1 else "~")
+                sentiment_line = f"\nSentiment [{s_emoji}]: {sentiment_score:+.2f}"
 
-            support_line = f"🎯 En yakın destek: ${nearest_support:,.4f}\n" if nearest_support else ""
-            resist_line = f"🎯 En yakın hedef:  ${nearest_resist:,.4f}\n" if nearest_resist else ""
+            support_line = f"Destek: ${nearest_support:,.4f}\n" if nearest_support else ""
+            resist_line = f"Hedef:  ${nearest_resist:,.4f}\n" if nearest_resist else ""
 
             msg = (
-                f"📊 GRID SEVİYELERİ — {pair}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"💰 Pozisyon: {position_size} USDC\n"
-                f"📈 Üst sınır: ${upper:,.4f}\n"
-                f"📉 Alt sınır: ${lower:,.4f}\n"
-                f"💵 Şu anki fiyat: ${current_rate:,.4f}\n"
+                f"GRID SEVIYELERI -- {pair}\n"
+                f"----------------------------\n"
+                f"Pozisyon: {position_size} USDC\n"
+                f"Ust sinir: ${upper:,.4f}\n"
+                f"Alt sinir: ${lower:,.4f}\n"
+                f"Fiyat: ${current_rate:,.4f}\n"
                 f"{support_line}"
                 f"{resist_line}"
-                f"📐 Aralık: {spacing}{sentiment_line}\n\n"
-                f"Tüm seviyeler ({len(levels)} adet):\n"
+                f"Aralik: {spacing}{sentiment_line}\n\n"
+                f"Seviyeler ({len(levels)} adet):\n"
                 f"{levels_str}"
-                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🕐 {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+                f"----------------------------\n"
+                f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}"
             )
 
-            if hasattr(self, 'dp') and self.dp:
-                self.dp.send_msg(msg, always_send=True)
-                logger.info("[GRID NOTIFY] Sent grid levels for %s to Telegram", pair)
-            else:
-                logger.warning("[GRID NOTIFY] DataProvider not available, cannot send Telegram")
+            self._dp_send(msg, always_send=True)
+            logger.info("[GRID NOTIFY] Sent grid levels for %s to Telegram", pair)
         except Exception as exc:
             logger.error("[GRID NOTIFY] Failed to send grid levels for %s: %s", pair, exc)
+
+    def _send_startup_summary(self) -> None:
+        """Send a one-time startup summary of all loaded grid pairs."""
+        try:
+            if not self._cache:
+                return
+            pairs = list(self._cache.keys())
+            lines = [
+                f"Bot baslatildi -- DynamicGridStrategy",
+                f"----------------------------",
+                f"Kar hedefi: %3 net (minimal_roi)",
+                f"Stop-loss: %12",
+                f"Timeframe: 5m",
+                f"Grid dosyasi: final_grid.json",
+                f"",
+                f"Yuklenen coinler ({len(pairs)}):",
+            ]
+            for pair in pairs:
+                gd = self._cache.get(pair, {})
+                n = len(gd.get("levels", []))
+                ps = gd.get("position_size", "?")
+                lines.append(f"  {pair}: {n} seviye, {ps} USDC/pozisyon")
+            lines.append(f"----------------------------")
+            lines.append(f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
+            self._dp_send("\n".join(lines), always_send=True)
+            logger.info("[STARTUP] Startup summary sent to Telegram")
+        except Exception as exc:
+            logger.error("[STARTUP] Failed to send startup summary: %s", exc)
+
+    # -------------------------------------------------------------------------
+    # Cache management
+    # -------------------------------------------------------------------------
 
     def _refresh_cache(self) -> None:
         """Reload final_grid.json if cache is stale."""
@@ -173,6 +233,25 @@ class DynamicGridStrategy(IStrategy):
         """Return position_size from grid config, or fallback."""
         self._refresh_cache()
         return float(self._cache.get(pair, {}).get("position_size", fallback))
+
+    # -------------------------------------------------------------------------
+    # Freqtrade lifecycle hooks
+    # -------------------------------------------------------------------------
+
+    def bot_loop_start(self, current_time: datetime, **kwargs) -> None:
+        """Called at the start of each bot loop iteration (every ~5s).
+
+        Used to:
+        - Send one-time startup summary to Telegram
+        - Force cache refresh on first run
+        """
+        if not self._startup_notified:
+            # Force cache load on first run
+            self._cache_ts = 0.0
+            self._refresh_cache()
+            if self._cache:
+                self._send_startup_summary()
+                self._startup_notified = True
 
     # -------------------------------------------------------------------------
     # Indicators
@@ -229,7 +308,7 @@ class DynamicGridStrategy(IStrategy):
         return dataframe
 
     # -------------------------------------------------------------------------
-    # Grid take-profit exit
+    # Grid take-profit exit — %3 net kar hedefi
     # -------------------------------------------------------------------------
 
     def custom_exit(
@@ -243,9 +322,12 @@ class DynamicGridStrategy(IStrategy):
     ) -> Optional[str]:
         """Exit when price reaches the next grid level above average entry.
 
-        Waits for at least +0.5% profit to avoid noise exits.
+        Profit target: NET %3 (MIN_PROFIT_FOR_EXIT = 0.01 as noise filter).
+        minimal_roi {"0": 0.03} acts as safety net if grid TP is not triggered.
+        Sends detailed Telegram notification on TP exit.
         """
-        if current_profit < 0.005:
+        # Noise filter: ignore tiny moves (aligned with %3 daily target)
+        if current_profit < MIN_PROFIT_FOR_EXIT:
             return None
 
         levels = self._levels(pair)
@@ -254,15 +336,37 @@ class DynamicGridStrategy(IStrategy):
 
         avg = trade.open_rate
         # Find all grid levels meaningfully above the average entry
-        above = [l for l in levels if l > avg * 1.001]
+        above = [lv for lv in levels if lv > avg * 1.001]
         if not above:
             return None
 
         target = min(above)  # nearest level above entry = take-profit target
         if current_rate >= target * (1.0 - PROXIMITY_PCT / 2.0):
+            profit_pct = current_profit * 100
+            hold_hours = (
+                (current_time - trade.open_date_utc).total_seconds() / 3600
+                if hasattr(trade, "open_date_utc") and trade.open_date_utc
+                else 0.0
+            )
+            profit_usdc = current_profit * trade.stake_amount
+
             logger.info(
-                "[GRID TP] %s: rate=%.4f target=%.4f profit=+%.2f%%",
-                pair, current_rate, target, current_profit * 100,
+                "[GRID TP] %s: rate=%.4f target=%.4f profit=+%.2f%% hold=%.1fh",
+                pair, current_rate, target, profit_pct, hold_hours,
+            )
+
+            # Telegram TP notification
+            self._dp_send(
+                f"GRID TP -- {pair}\n"
+                f"----------------------------\n"
+                f"Kar: +{profit_pct:.2f}% (+{profit_usdc:.2f} USDC)\n"
+                f"Fiyat: ${current_rate:,.4f}\n"
+                f"Hedef seviye: ${target:,.4f}\n"
+                f"Hold: {hold_hours:.1f} saat\n"
+                f"Pozisyon: {trade.stake_amount:.2f} USDC\n"
+                f"----------------------------\n"
+                f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}",
+                always_send=True,
             )
             return "grid_tp"
 
@@ -290,6 +394,7 @@ class DynamicGridStrategy(IStrategy):
 
         Each call checks whether price has reached the (N+1)-th grid level
         below the average entry, where N = number of DCA entries so far.
+        Sends Telegram notification on each DCA trigger.
         """
         levels = self._levels(trade.pair)
         if not levels:
@@ -297,7 +402,7 @@ class DynamicGridStrategy(IStrategy):
 
         # Grid levels strictly below average entry, sorted highest-first
         below = sorted(
-            [l for l in levels if l < trade.open_rate * 0.999],
+            [lv for lv in levels if lv < trade.open_rate * 0.999],
             reverse=True,
         )
         if not below:
@@ -324,6 +429,20 @@ class DynamicGridStrategy(IStrategy):
             "[GRID DCA] %s: adding %.2f USDC @ %.4f (level=%.4f, dca#%d)",
             trade.pair, stake, current_rate, next_level, dca_done + 1,
         )
+
+        # Telegram DCA notification
+        self._dp_send(
+            f"GRID DCA #{dca_done + 1} -- {trade.pair}\n"
+            f"----------------------------\n"
+            f"Eklenen: {stake:.2f} USDC\n"
+            f"Fiyat: ${current_rate:,.4f}\n"
+            f"Seviye: ${next_level:,.4f}\n"
+            f"Mevcut kar: {current_profit * 100:+.2f}%\n"
+            f"Toplam giris: {trade.nr_of_successful_entries + 1}\n"
+            f"----------------------------\n"
+            f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}",
+            always_send=True,
+        )
         return stake
 
     # -------------------------------------------------------------------------
@@ -334,7 +453,6 @@ class DynamicGridStrategy(IStrategy):
         self,
         current_time,
         current_rate: float,
-        current_profit: float,
         proposed_stake: float,
         min_stake: Optional[float],
         max_stake: float,

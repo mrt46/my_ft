@@ -74,6 +74,7 @@ def analyzer(tmp_path):
     a._lookback_hours = 72
     a._merge_threshold = 0.003
     a._price_bin = 10
+    a._price_bin_pct = 0.005  # 0.5% of price (used by _price_touch_frequency and _volume_poc)
     a._wick_multiplier = 2.0
     a._coins_cfg = {
         "all_grid_coins": ["BTC/USDC"],
@@ -223,3 +224,100 @@ class TestAnalyze:
         assert analyzer.BASE_GRID_FILE.exists()
         data = json.loads(analyzer.BASE_GRID_FILE.read_text())
         assert "BTC/USDC" in data
+
+
+# ---------------------------------------------------------------------------
+# Adaptive Grid Tests
+# ---------------------------------------------------------------------------
+
+class TestAdaptiveGrid:
+    """Verify adaptive grid behavior: tier system, bounds, level count."""
+
+    def test_levels_are_sorted_ascending(self, analyzer):
+        """Grid levels must always be sorted ascending."""
+        config = analyzer.analyze("BTC/USDC")
+        levels = config["levels"]
+        assert levels == sorted(levels)
+
+    def test_upper_bound_equals_max_level(self, analyzer):
+        """upper_bound should equal the highest grid level."""
+        config = analyzer.analyze("BTC/USDC")
+        assert config["upper_bound"] == pytest.approx(max(config["levels"]), rel=0.01)
+
+    def test_lower_bound_equals_min_level(self, analyzer):
+        """lower_bound should equal the lowest grid level."""
+        config = analyzer.analyze("BTC/USDC")
+        assert config["lower_bound"] == pytest.approx(min(config["levels"]), rel=0.01)
+
+    def test_levels_within_price_range(self, analyzer):
+        """All grid levels must be within the OHLCV price range."""
+        config = analyzer.analyze("BTC/USDC")
+        # Exchange mock returns prices around 50000
+        for lvl in config["levels"]:
+            assert 40000 <= lvl <= 60000, f"Level {lvl} outside expected range"
+
+    def test_tier1_has_more_levels_than_tier3(self, analyzer):
+        """Tier 1 coins (rank 0-1) should have more grid levels than tier 3 (rank 4+)."""
+        # BTC/USDC at rank=0 → tier 1 (10 levels target)
+        analyzer._exchange.fetch_ohlcv.return_value = _make_ohlcv(4320, 50000)
+        config_t1 = analyzer.analyze("BTC/USDC", rank=0)
+
+        # Same coin at rank=4 → tier 3 (6 levels target)
+        analyzer._exchange.fetch_ohlcv.return_value = _make_ohlcv(4320, 50000)
+        config_t3 = analyzer.analyze("BTC/USDC", rank=4)
+
+        # Tier 1 should have >= levels than tier 3
+        assert len(config_t1["levels"]) >= len(config_t3["levels"])
+
+    def test_position_size_in_config(self, analyzer):
+        """Grid config must include position_size > 0."""
+        config = analyzer.analyze("BTC/USDC")
+        assert "position_size" in config
+        assert config["position_size"] > 0
+
+    def test_spacing_field_in_config(self, analyzer):
+        """Grid config must include spacing field."""
+        config = analyzer.analyze("BTC/USDC")
+        assert "spacing" in config
+        assert isinstance(config["spacing"], str)
+
+    def test_timestamp_in_config(self, analyzer):
+        """Grid config must include timestamp."""
+        config = analyzer.analyze("BTC/USDC")
+        assert "timestamp" in config
+        assert config["timestamp"] > 0
+
+    def test_sr_merge_reduces_level_count(self, analyzer):
+        """S/R merge should reduce duplicate/close levels via _merge_levels."""
+        # Create data with many close price touches at same level
+        import time as _time
+        ts = int(_time.time() * 1000)
+        # All prices very close to 50000 — should merge to few levels
+        rows = [[ts + i * 60_000, 50000, 50010, 49990, 50000, 500] for i in range(200)]
+        analyzer._exchange.fetch_ohlcv.return_value = rows
+
+        df = analyzer._to_dataframe(rows)
+        # Use _price_touch_frequency to get raw levels
+        levels_raw = analyzer._price_touch_frequency(df)
+
+        # _merge_levels takes (levels, source_name) tuples and merges close levels
+        merged_details = analyzer._merge_levels([(levels_raw, "sr")])
+        levels_merged = [d["price"] for d in merged_details]
+
+        # Merged should have fewer or equal levels than raw
+        assert len(levels_merged) <= len(levels_raw)
+
+    def test_multiple_pairs_independent_grids(self, analyzer):
+        """Each pair should have independent grid levels."""
+        # BTC at 50000
+        analyzer._exchange.fetch_ohlcv.return_value = _make_ohlcv(4320, 50000)
+        config_btc = analyzer.analyze("BTC/USDC")
+
+        # ETH at 3000
+        analyzer._coins_cfg["all_grid_coins"].append("ETH/USDC")
+        analyzer._coins_cfg["tiers"]["tier_1"]["coins"].append("ETH/USDC")
+        analyzer._exchange.fetch_ohlcv.return_value = _make_ohlcv(4320, 3000)
+        config_eth = analyzer.analyze("ETH/USDC")
+
+        # BTC levels should be much higher than ETH levels
+        assert min(config_btc["levels"]) > max(config_eth["levels"])

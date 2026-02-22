@@ -83,6 +83,12 @@
     "bot_name": "DynamicGridBot",
     "initial_state": "running",
     "force_entry_enable": false,
+    "minimal_roi": {
+        "0": 0.03,
+        "1440": 0.02,
+        "2880": 0.01
+    },
+    "stoploss": -0.12,
     "internals": {
         "process_throttle_secs": 5
     }

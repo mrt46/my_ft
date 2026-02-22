@@ -339,3 +339,157 @@ class TestFullRun:
         assert result["pair"] == "BTC/USDC"
         assert result["sentiment_applied"] is True
         assert result["sentiment_score"] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# Sentiment Shift Validation Tests
+# ---------------------------------------------------------------------------
+
+class TestSentimentShiftValidation:
+    """Verify sentiment shift is applied correctly and within bounds."""
+
+    def test_sentiment_shift_pct_recorded(self, grid_fusion):
+        """Fused grid should record the actual shift percentage applied."""
+        grid = {
+            "pair": "BTC/USDC",
+            "upper_bound": 70000.0,
+            "lower_bound": 60000.0,
+            "levels": [60000.0, 65000.0, 70000.0],
+            "position_size": 10.0,
+            "spacing": "fibonacci",
+            "timestamp": time.time(),
+        }
+        sentiment = {"sentiment": 0.6, "usable": True}
+
+        result = grid_fusion._fuse("BTC/USDC", grid, sentiment)
+        assert "sentiment_shift_pct" in result
+        assert isinstance(result["sentiment_shift_pct"], float)
+
+    def test_shift_is_proportional_to_sentiment(self, grid_fusion):
+        """Stronger sentiment should produce larger shift."""
+        grid_base = {
+            "pair": "BTC/USDC",
+            "upper_bound": 70000.0,
+            "lower_bound": 60000.0,
+            "levels": [60000.0, 65000.0, 70000.0],
+            "position_size": 10.0,
+            "spacing": "fibonacci",
+            "timestamp": time.time(),
+        }
+
+        result_weak = grid_fusion._fuse("BTC/USDC", dict(grid_base), {"sentiment": 0.4, "usable": True})
+        result_strong = grid_fusion._fuse("BTC/USDC", dict(grid_base), {"sentiment": 0.9, "usable": True})
+
+        assert abs(result_strong["sentiment_shift_pct"]) >= abs(result_weak["sentiment_shift_pct"])
+
+    def test_levels_count_preserved_after_shift(self, grid_fusion):
+        """Number of grid levels should be preserved after sentiment shift."""
+        grid = {
+            "pair": "BTC/USDC",
+            "upper_bound": 70000.0,
+            "lower_bound": 60000.0,
+            "levels": [60000.0, 62000.0, 64000.0, 66000.0, 68000.0, 70000.0],
+            "position_size": 10.0,
+            "spacing": "fibonacci",
+            "timestamp": time.time(),
+        }
+        sentiment = {"sentiment": 0.7, "usable": True}
+
+        result = grid_fusion._fuse("BTC/USDC", grid, sentiment)
+        assert len(result["levels"]) == 6
+
+    def test_levels_remain_sorted_after_shift(self, grid_fusion):
+        """Grid levels must remain sorted after sentiment shift."""
+        grid = {
+            "pair": "BTC/USDC",
+            "upper_bound": 70000.0,
+            "lower_bound": 60000.0,
+            "levels": [60000.0, 65000.0, 70000.0],
+            "position_size": 10.0,
+            "spacing": "fibonacci",
+            "timestamp": time.time(),
+        }
+        for sentiment_val in [-0.9, -0.5, 0.0, 0.5, 0.9]:
+            result = grid_fusion._fuse("BTC/USDC", dict(grid), {"sentiment": sentiment_val, "usable": True})
+            assert result["levels"] == sorted(result["levels"]), \
+                f"Levels not sorted for sentiment={sentiment_val}"
+
+    def test_sentiment_applied_flag(self, grid_fusion):
+        """sentiment_applied should be True when sentiment is usable and non-neutral."""
+        grid = {
+            "pair": "BTC/USDC",
+            "upper_bound": 70000.0,
+            "lower_bound": 60000.0,
+            "levels": [60000.0, 65000.0, 70000.0],
+            "position_size": 10.0,
+            "spacing": "fibonacci",
+            "timestamp": time.time(),
+        }
+        result = grid_fusion._fuse("BTC/USDC", grid, {"sentiment": 0.8, "usable": True})
+        assert result["sentiment_applied"] is True
+
+    def test_sentiment_not_applied_when_unusable(self, grid_fusion):
+        """sentiment_applied should be False when sentiment is unusable."""
+        grid = {
+            "pair": "BTC/USDC",
+            "upper_bound": 70000.0,
+            "lower_bound": 60000.0,
+            "levels": [60000.0, 65000.0, 70000.0],
+            "position_size": 10.0,
+            "spacing": "fibonacci",
+            "timestamp": time.time(),
+        }
+        result = grid_fusion._fuse("BTC/USDC", grid, {"sentiment": 0.8, "usable": False})
+        assert result["sentiment_applied"] is False
+
+
+# ---------------------------------------------------------------------------
+# Neutral Fallback Tests
+# ---------------------------------------------------------------------------
+
+class TestNeutralFallback:
+    """Verify neutral sentiment fallback behavior."""
+
+    def test_missing_sentiment_uses_neutral(self, grid_fusion):
+        """When sentiment data is missing for a pair, use neutral (no shift)."""
+        base_data = {
+            "BTC/USDC": {
+                "pair": "BTC/USDC",
+                "upper_bound": 70000.0,
+                "lower_bound": 60000.0,
+                "levels": [60000.0, 65000.0, 70000.0],
+                "level_details": [],
+                "spacing": "fibonacci",
+                "position_size": 10.0,
+                "timestamp": time.time(),
+            },
+        }
+        grid_fusion.BASE_GRID_FILE.write_text(json.dumps(base_data))
+        # No sentiment data for BTC
+        grid_fusion.SENTIMENT_FILE.write_text(json.dumps({}))
+
+        result = grid_fusion.run()
+        assert "BTC/USDC" in result
+        # No shift applied — levels should be unchanged
+        assert result["BTC/USDC"]["sentiment_shift_pct"] == 0.0
+
+    def test_final_grid_has_timestamp(self, grid_fusion):
+        """Final grid should include a timestamp for each pair."""
+        base_data = {
+            "BTC/USDC": {
+                "pair": "BTC/USDC",
+                "upper_bound": 70000.0,
+                "lower_bound": 60000.0,
+                "levels": [60000.0, 65000.0, 70000.0],
+                "level_details": [],
+                "spacing": "fibonacci",
+                "position_size": 10.0,
+                "timestamp": time.time(),
+            },
+        }
+        grid_fusion.BASE_GRID_FILE.write_text(json.dumps(base_data))
+        grid_fusion.SENTIMENT_FILE.write_text(json.dumps({}))
+
+        result = grid_fusion.run()
+        assert "timestamp" in result["BTC/USDC"]
+        assert result["BTC/USDC"]["timestamp"] > 0
