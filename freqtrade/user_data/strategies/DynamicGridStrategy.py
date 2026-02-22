@@ -96,16 +96,29 @@ class DynamicGridStrategy(IStrategy):
     # Telegram helpers
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _escape_markdown(text: str) -> str:
+        """Escape special Markdown characters to avoid Telegram parse errors.
+
+        Freqtrade sends dp.send_msg() messages with ParseMode.MARKDOWN.
+        Characters that need escaping: _ * [ ] ( ) ~ ` > # + - = | { } . !
+        """
+        # Only escape the most problematic ones for readability
+        for ch in ["_", "*", "[", "]", "(", ")", "`"]:
+            text = text.replace(ch, f"\\{ch}")
+        return text
+
     def _dp_send(self, msg: str, always_send: bool = True) -> None:
         """Send a message via Freqtrade's dp.send_msg() (requires allow_custom_messages: true).
 
         Args:
-            msg: Plain-text message (no HTML — dp.send_msg uses plain text).
+            msg: Plain-text message. Will be Markdown-escaped before sending.
             always_send: If True, bypasses dedup cache. Default True for trade events.
         """
         try:
             if hasattr(self, "dp") and self.dp:
-                self.dp.send_msg(msg, always_send=always_send)
+                safe_msg = self._escape_markdown(msg)
+                self.dp.send_msg(safe_msg, always_send=always_send)
             else:
                 logger.warning("[TG] DataProvider not available, cannot send message")
         except Exception as exc:
@@ -135,33 +148,33 @@ class DynamicGridStrategy(IStrategy):
             levels_str = ""
             for lvl in sorted(levels):
                 if nearest_support and abs(lvl - nearest_support) < 0.0001:
-                    levels_str += f"  >> ${lvl:,.4f}  <- destek\n"
+                    levels_str += f"  >> {lvl:,.4f}  destek\n"
                 elif nearest_resist and abs(lvl - nearest_resist) < 0.0001:
-                    levels_str += f"  >> ${lvl:,.4f}  <- hedef\n"
+                    levels_str += f"  >> {lvl:,.4f}  hedef\n"
                 else:
-                    levels_str += f"  . ${lvl:,.4f}\n"
+                    levels_str += f"  .  {lvl:,.4f}\n"
 
             sentiment_line = ""
             if sentiment_score is not None:
-                s_emoji = "+" if sentiment_score > 0.1 else ("-" if sentiment_score < -0.1 else "~")
-                sentiment_line = f"\nSentiment [{s_emoji}]: {sentiment_score:+.2f}"
+                s_tag = "pozitif" if sentiment_score > 0.1 else ("negatif" if sentiment_score < -0.1 else "notr")
+                sentiment_line = f"\nSentiment {s_tag}: {sentiment_score:+.2f}"
 
-            support_line = f"Destek: ${nearest_support:,.4f}\n" if nearest_support else ""
-            resist_line = f"Hedef:  ${nearest_resist:,.4f}\n" if nearest_resist else ""
+            support_line = f"Destek: {nearest_support:,.4f}\n" if nearest_support else ""
+            resist_line = f"Hedef:  {nearest_resist:,.4f}\n" if nearest_resist else ""
 
             msg = (
-                f"GRID SEVIYELERI -- {pair}\n"
-                f"----------------------------\n"
+                f"GRID SEVIYELERI {pair}\n"
+                f"========================\n"
                 f"Pozisyon: {position_size} USDC\n"
-                f"Ust sinir: ${upper:,.4f}\n"
-                f"Alt sinir: ${lower:,.4f}\n"
-                f"Fiyat: ${current_rate:,.4f}\n"
+                f"Ust sinir: {upper:,.4f}\n"
+                f"Alt sinir: {lower:,.4f}\n"
+                f"Fiyat: {current_rate:,.4f}\n"
                 f"{support_line}"
                 f"{resist_line}"
                 f"Aralik: {spacing}{sentiment_line}\n\n"
-                f"Seviyeler ({len(levels)} adet):\n"
+                f"Seviyeler {len(levels)} adet:\n"
                 f"{levels_str}"
-                f"----------------------------\n"
+                f"========================\n"
                 f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}"
             )
 
@@ -177,21 +190,21 @@ class DynamicGridStrategy(IStrategy):
                 return
             pairs = list(self._cache.keys())
             lines = [
-                f"Bot baslatildi -- DynamicGridStrategy",
-                f"----------------------------",
-                f"Kar hedefi: %3 net (minimal_roi)",
-                f"Stop-loss: %12",
+                f"Bot baslatildi DynamicGridStrategy",
+                f"========================",
+                f"Kar hedefi: %3 net minimal roi",
+                f"Stop loss: %12",
                 f"Timeframe: 5m",
-                f"Grid dosyasi: final_grid.json",
+                f"Grid dosyasi: final grid json",
                 f"",
-                f"Yuklenen coinler ({len(pairs)}):",
+                f"Yuklenen coinler {len(pairs)} adet:",
             ]
             for pair in pairs:
                 gd = self._cache.get(pair, {})
                 n = len(gd.get("levels", []))
                 ps = gd.get("position_size", "?")
-                lines.append(f"  {pair}: {n} seviye, {ps} USDC/pozisyon")
-            lines.append(f"----------------------------")
+                lines.append(f"  {pair}: {n} seviye, {ps} USDC pozisyon")
+            lines.append(f"========================")
             lines.append(f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
             self._dp_send("\n".join(lines), always_send=True)
             logger.info("[STARTUP] Startup summary sent to Telegram")
@@ -357,14 +370,14 @@ class DynamicGridStrategy(IStrategy):
 
             # Telegram TP notification
             self._dp_send(
-                f"GRID TP -- {pair}\n"
-                f"----------------------------\n"
+                f"GRID TP {pair}\n"
+                f"========================\n"
                 f"Kar: +{profit_pct:.2f}% (+{profit_usdc:.2f} USDC)\n"
-                f"Fiyat: ${current_rate:,.4f}\n"
-                f"Hedef seviye: ${target:,.4f}\n"
+                f"Fiyat: {current_rate:,.4f}\n"
+                f"Hedef seviye: {target:,.4f}\n"
                 f"Hold: {hold_hours:.1f} saat\n"
                 f"Pozisyon: {trade.stake_amount:.2f} USDC\n"
-                f"----------------------------\n"
+                f"========================\n"
                 f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}",
                 always_send=True,
             )
@@ -432,14 +445,14 @@ class DynamicGridStrategy(IStrategy):
 
         # Telegram DCA notification
         self._dp_send(
-            f"GRID DCA #{dca_done + 1} -- {trade.pair}\n"
-            f"----------------------------\n"
+            f"GRID DCA {dca_done + 1} {trade.pair}\n"
+            f"========================\n"
             f"Eklenen: {stake:.2f} USDC\n"
-            f"Fiyat: ${current_rate:,.4f}\n"
-            f"Seviye: ${next_level:,.4f}\n"
+            f"Fiyat: {current_rate:,.4f}\n"
+            f"Seviye: {next_level:,.4f}\n"
             f"Mevcut kar: {current_profit * 100:+.2f}%\n"
             f"Toplam giris: {trade.nr_of_successful_entries + 1}\n"
-            f"----------------------------\n"
+            f"========================\n"
             f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}",
             always_send=True,
         )
