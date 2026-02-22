@@ -8,6 +8,9 @@ Sources:
     - NewsAPI (free tier: 100 requests/day)
     - CoinDesk RSS (unlimited, slower)
 
+Logging:
+    - logs/news_YYYYMMDD.jsonl — her çekilen haber batch'i JSONL formatında loglanır
+
 Usage:
     fetcher = NewsFetcher()
     news = await fetcher.fetch_news_for_coin('BTC', hours=24)
@@ -18,7 +21,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TypedDict
 from xml.etree import ElementTree as ET
@@ -70,6 +73,10 @@ class NewsFetcher:
         - TTL: 30 minutes (configurable)
         - Reduces API calls and improves speed
 
+    Logging:
+        - logs/news_YYYYMMDD.jsonl — her fetch işlemi JSONL formatında loglanır
+        - Her satır: {ts, coin, source, count, articles[]}
+
     Example:
         fetcher = NewsFetcher()
         articles = await fetcher.fetch_news_for_coin('BTC', hours=24)
@@ -77,6 +84,7 @@ class NewsFetcher:
     """
 
     CACHE_FILE = Path(__file__).parent.parent / "data" / "news_cache.json"
+    LOG_DIR = Path(__file__).parent.parent / "logs"
 
     # API endpoints
     CRYPTOPANIC_URL = "https://cryptopanic.com/api/v1/posts/"
@@ -132,16 +140,20 @@ class NewsFetcher:
         # Check cache first
         if self._is_cache_valid(cache_key):
             logger.debug(f"Using cached news for {coin}")
-            return self._cache[cache_key]["articles"]
+            cached = self._cache[cache_key]["articles"]
+            self._log_news(coin, "cache", cached)
+            return cached
 
         # Fetch from sources (with fallback)
         articles: list[NewsArticle] = []
+        used_source = "none"
 
         try:
             # Primary: CryptoPanic
             if self._cryptopanic_key:
                 articles = await self._fetch_cryptopanic(coin, hours)
                 if articles:
+                    used_source = "cryptopanic"
                     logger.info(f"CryptoPanic: {len(articles)} articles for {coin}")
         except Exception as exc:
             logger.warning(f"CryptoPanic failed for {coin}: {exc}")
@@ -151,6 +163,7 @@ class NewsFetcher:
             try:
                 articles = await self._fetch_newsapi(coin, hours)
                 if articles:
+                    used_source = "newsapi"
                     logger.info(f"NewsAPI: {len(articles)} articles for {coin}")
             except Exception as exc:
                 logger.warning(f"NewsAPI failed for {coin}: {exc}")
@@ -160,18 +173,23 @@ class NewsFetcher:
             try:
                 articles = await self._fetch_rss(coin, hours)
                 if articles:
+                    used_source = "rss"
                     logger.info(f"RSS: {len(articles)} articles for {coin}")
             except Exception as exc:
                 logger.warning(f"RSS failed for {coin}: {exc}")
 
+        # Log fetched articles
+        final_articles = articles[: self._max_articles]
+        self._log_news(coin, used_source, final_articles)
+
         # Cache and return
         self._cache[cache_key] = {
-            "articles": articles[: self._max_articles],
+            "articles": final_articles,
             "timestamp": time.time(),
         }
         self._save_cache()
 
-        return articles[: self._max_articles]
+        return final_articles
 
     async def fetch_news_for_coins(
         self, coins: list[str], hours: int = 24
@@ -219,6 +237,45 @@ class NewsFetcher:
         if self.CACHE_FILE.exists():
             self.CACHE_FILE.unlink()
         logger.info("News cache cleared")
+
+    def _log_news(self, coin: str, source: str, articles: list[NewsArticle]) -> None:
+        """Append a news fetch record to logs/news_YYYYMMDD.jsonl.
+
+        Each line is a self-contained JSON object:
+            {ts, coin, source, count, articles[{title, source, url, published_at, sentiment_hint}]}
+
+        Args:
+            coin: Coin symbol (e.g. 'BTC').
+            source: Which source provided the articles ('cryptopanic', 'newsapi', 'rss', 'cache').
+            articles: List of fetched articles.
+        """
+        try:
+            self.LOG_DIR.mkdir(parents=True, exist_ok=True)
+            today = datetime.now(timezone.utc).strftime("%Y%m%d")
+            log_file = self.LOG_DIR / f"news_{today}.jsonl"
+
+            record = {
+                "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "coin": coin,
+                "source": source,
+                "count": len(articles),
+                "articles": [
+                    {
+                        "title": a["title"],
+                        "source": a["source"],
+                        "url": a["url"],
+                        "published_at": a["published_at"],
+                        "sentiment_hint": a["sentiment_hint"],
+                    }
+                    for a in articles
+                ],
+            }
+
+            with open(log_file, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        except Exception as exc:
+            logger.warning("Failed to write news log: %s", exc)
 
     # ------------------------------------------------------------------
     # Internal: CryptoPanic

@@ -87,6 +87,8 @@ sentiment:
   min_confidence: 0.6             # Confidence < 0.6 → sentiment ignore
   min_llms_required: 2            # En az 2 LLM başarılı olmalı
   news_batch_size: 10
+  news_hours: 24                  # Kaç saatlik haberleri analiz et
+  prompt_version: "v2"            # "v1" (temel) veya "v2" (gelişmiş, önerilen)
   weight_deepseek: 0.35
   weight_gpt4o: 0.35
   weight_gemini: 0.30

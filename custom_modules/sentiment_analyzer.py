@@ -2,7 +2,14 @@
 
 Queries DeepSeek v3, GPT-4o Mini, and Gemini 2.0 Flash in parallel,
 then aggregates individual scores into a final consensus sentiment.
-Results are saved to ``data/sentiment_scores.json``.
+
+Results are saved to:
+    - data/sentiment_scores.json       — son sentiment sonuçları (coin → SentimentResult)
+    - logs/sentiment_YYYYMMDD.jsonl    — günlük sentiment log (her çalışma kaydedilir)
+
+Prompt versiyonları:
+    - v1 (temel): Sadece haber listesi + JSON çıktısı
+    - v2 (gelişmiş): Bağlam zenginleştirme, skor rehberi, key_events, risk_factors
 """
 
 import asyncio
@@ -10,6 +17,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict
 
@@ -29,9 +37,11 @@ class LLMScore(TypedDict):
     """Raw score returned by a single LLM."""
 
     provider: str
-    sentiment: float    # -1.0 (very bearish) … +1.0 (very bullish)
-    confidence: float   # 0.0 … 1.0
+    sentiment: float      # -1.0 (very bearish) … +1.0 (very bullish)
+    confidence: float     # 0.0 … 1.0
     reasoning: str
+    key_events: list[str]   # Ana olaylar (v2 prompt ile dolar)
+    risk_factors: list[str] # Risk faktörleri (v2 prompt ile dolar)
 
 
 class SentimentResult(TypedDict):
@@ -44,13 +54,16 @@ class SentimentResult(TypedDict):
     individual_scores: dict[str, LLMScore]
     usable: bool           # False if confidence < threshold or < min_llms
     timestamp: float
+    news_count: int        # Kaç haber analiz edildi
+    prompt_version: str    # "v1" veya "v2"
 
 
 # ---------------------------------------------------------------------------
-# Prompt template
+# Prompt templates
 # ---------------------------------------------------------------------------
 
-_PROMPT_TEMPLATE = """You are a crypto market analyst. Analyse the following recent news about {coin} and provide a sentiment score.
+# v1 — Temel prompt (geriye uyumluluk için korunur)
+_PROMPT_V1 = """You are a crypto market analyst. Analyse the following recent news about {coin} and provide a sentiment score.
 
 NEWS:
 {news_text}
@@ -61,6 +74,46 @@ Respond ONLY with valid JSON in this exact format:
   "confidence": <float between 0.0 and 1.0, how confident you are>,
   "reasoning": "<one sentence explanation>"
 }}"""
+
+# v2 — Gelişmiş prompt (bağlam zenginleştirme, skor rehberi, key_events)
+_PROMPT_V2 = """You are an expert crypto market analyst specializing in short-term price movements.
+
+TASK: Analyze the sentiment of recent news about {coin} for a SHORT-TERM TRADING SIGNAL (next 4-24 hours).
+
+CONTEXT:
+- Analysis date: {date_utc} UTC
+- News window: last {hours}h
+
+NEWS (sorted by recency, {news_count} articles):
+{news_text}
+
+SCORING GUIDE:
+  +0.8 to +1.0 : Strong bullish catalyst (ETF approval, major partnership, exchange listing, halving)
+  +0.4 to +0.7 : Moderate bullish (positive adoption news, whale accumulation, protocol upgrade)
+  +0.1 to +0.3 : Slightly bullish (minor positive news, community growth, minor partnership)
+  -0.1 to +0.1 : Neutral (routine updates, no clear direction, mixed signals)
+  -0.1 to -0.3 : Slightly bearish (minor negative news, profit-taking, minor regulatory concern)
+  -0.4 to -0.7 : Moderate bearish (regulatory crackdown, competitor advantage, large sell-off)
+  -0.8 to -1.0 : Strong bearish catalyst (exchange hack, government ban, major fraud, protocol failure)
+
+CONFIDENCE GUIDE:
+  0.9-1.0 : Multiple consistent high-impact signals
+  0.7-0.8 : Clear signal but limited sources
+  0.5-0.6 : Mixed signals or low-quality sources
+  0.3-0.4 : Very limited or ambiguous news
+  0.0-0.2 : No relevant news found
+
+Respond ONLY with valid JSON (no markdown, no extra text):
+{{
+  "sentiment": <float -1.0 to 1.0>,
+  "confidence": <float 0.0 to 1.0>,
+  "reasoning": "<2-3 sentences with specific news references>",
+  "key_events": ["<most impactful event 1>", "<event 2>"],
+  "risk_factors": ["<main risk 1>", "<risk 2>"]
+}}"""
+
+# Aktif prompt versiyonu (settings.yaml'dan override edilebilir)
+_DEFAULT_PROMPT_VERSION = "v2"
 
 
 # ---------------------------------------------------------------------------
@@ -73,12 +126,20 @@ class SentimentAnalyzer:
     Calls DeepSeek v3, GPT-4o Mini, and Gemini 2.0 Flash in parallel.
     Falls back gracefully if one LLM fails (minimum 2 required).
 
+    Prompt versiyonları:
+        - v1: Temel prompt (sadece haber listesi)
+        - v2: Gelişmiş prompt (bağlam, skor rehberi, key_events, risk_factors)
+
+    Logging:
+        - logs/sentiment_YYYYMMDD.jsonl — her analiz sonucu loglanır
+
     Example:
         analyzer = SentimentAnalyzer()
         result = asyncio.run(analyzer.get_sentiment(['BTC up 5%', 'ETH ETF approved'], 'BTC'))
     """
 
     SENTIMENT_FILE = Path(__file__).parent.parent / "data" / "sentiment_scores.json"
+    LOG_DIR = Path(__file__).parent.parent / "logs"
 
     def __init__(self) -> None:
         """Load settings and initialise API clients."""
@@ -95,23 +156,34 @@ class SentimentAnalyzer:
             "gpt4o": s.get("weight_gpt4o", 0.35),
             "gemini": s.get("weight_gemini", 0.30),
         }
+        self._prompt_version: str = s.get("prompt_version", _DEFAULT_PROMPT_VERSION)
+        self._news_hours: int = s.get("news_hours", 24)
 
         self._openai_key = os.getenv("OPENAI_API_KEY", "")
         self._deepseek_key = os.getenv("DEEPSEEK_API_KEY", "")
         self._gemini_key = os.getenv("GEMINI_API_KEY", "")
 
-        logger.info("SentimentAnalyzer initialised")
+        logger.info(
+            "SentimentAnalyzer initialised — prompt=%s, timeout=%ds, min_conf=%.1f",
+            self._prompt_version, self._timeout, self._min_confidence,
+        )
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    async def get_sentiment(self, news_batch: list[str], coin: str) -> SentimentResult:
+    async def get_sentiment(
+        self,
+        news_batch: list[str],
+        coin: str,
+        hours: int | None = None,
+    ) -> SentimentResult:
         """Fetch and aggregate sentiment from all 3 LLMs.
 
         Args:
             news_batch: List of recent news headlines/snippets for *coin*.
             coin: Coin symbol, e.g. ``'BTC'``.
+            hours: News window in hours (used in v2 prompt context). Defaults to settings value.
 
         Returns:
             SentimentResult with aggregated score and per-LLM breakdown.
@@ -121,8 +193,26 @@ class SentimentAnalyzer:
             - If fewer than ``min_llms`` succeed, ``usable`` is set to False.
             - If mean confidence < ``min_confidence``, ``usable`` is False.
         """
+        news_hours = hours or self._news_hours
+        news_count = len(news_batch)
         news_text = "\n".join(f"- {n}" for n in news_batch[:10])
-        prompt = _PROMPT_TEMPLATE.format(coin=coin, news_text=news_text)
+
+        # Build prompt based on configured version
+        if self._prompt_version == "v2":
+            prompt = _PROMPT_V2.format(
+                coin=coin,
+                date_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                hours=news_hours,
+                news_count=news_count,
+                news_text=news_text if news_text else "- No recent news found.",
+            )
+        else:
+            prompt = _PROMPT_V1.format(coin=coin, news_text=news_text)
+
+        logger.debug(
+            "[SENTIMENT] %s: sending %d news items to 3 LLMs (prompt=%s)",
+            coin, news_count, self._prompt_version,
+        )
 
         tasks = [
             self._call_deepseek(prompt, coin),
@@ -142,7 +232,7 @@ class SentimentAnalyzer:
             scores.append(result)
             individual[provider] = result
 
-        return self._aggregate(coin, scores, individual)
+        return self._aggregate(coin, scores, individual, news_count=news_count)
 
     def get_sentiment_sync(self, news_batch: list[str], coin: str) -> SentimentResult:
         """Synchronous wrapper around ``get_sentiment``.
@@ -289,7 +379,7 @@ class SentimentAnalyzer:
 
         content = data["choices"][0]["message"]["content"]
         parsed = self._parse_llm_response(content)
-        return LLMScore(provider="deepseek", **parsed)
+        return LLMScore(provider="deepseek", **parsed)  # type: ignore[misc]
 
     async def _call_gpt4o(self, prompt: str, coin: str) -> LLMScore:
         """Call GPT-4o Mini via OpenAI API.
@@ -318,7 +408,7 @@ class SentimentAnalyzer:
         )
         content = response.choices[0].message.content or ""
         parsed = self._parse_llm_response(content)
-        return LLMScore(provider="gpt4o", **parsed)
+        return LLMScore(provider="gpt4o", **parsed)  # type: ignore[misc]
 
     async def _call_gemini(self, prompt: str, coin: str) -> LLMScore:
         """Call Gemini 2.0 Flash via Google GenAI API (google-genai package).
@@ -354,7 +444,7 @@ class SentimentAnalyzer:
             timeout=self._timeout,
         )
         parsed = self._parse_llm_response(content)
-        return LLMScore(provider="gemini", **parsed)
+        return LLMScore(provider="gemini", **parsed)  # type: ignore[misc]
 
     # ------------------------------------------------------------------
     # Aggregation
@@ -365,6 +455,7 @@ class SentimentAnalyzer:
         coin: str,
         scores: list[LLMScore],
         individual: dict[str, LLMScore],
+        news_count: int = 0,
     ) -> SentimentResult:
         """Compute weighted average and consensus metrics.
 
@@ -372,13 +463,16 @@ class SentimentAnalyzer:
             coin: Coin symbol.
             scores: Successful LLM results.
             individual: Full per-provider mapping.
+            news_count: Number of news articles that were analysed.
 
         Returns:
             SentimentResult with ``usable`` flag.
         """
         if not scores:
             logger.error(f"All LLMs failed for {coin}")
-            return self._empty_result(coin, individual)
+            result = self._empty_result(coin, individual, news_count)
+            self._log_sentiment(result)
+            return result
 
         if len(scores) < self._min_llms:
             logger.warning(f"Only {len(scores)} LLMs succeeded for {coin} (min={self._min_llms})")
@@ -410,16 +504,20 @@ class SentimentAnalyzer:
             "individual_scores": individual,
             "usable": usable,
             "timestamp": time.time(),
+            "news_count": news_count,
+            "prompt_version": self._prompt_version,
         }
 
         self._save(coin, result)
+        self._log_sentiment(result)
         logger.info(
-            f"Sentiment {coin}: {sentiment:+.3f} (conf={mean_confidence:.2f}, "
-            f"agree={agreement:.2f}, usable={usable})"
+            "[SENTIMENT] %s: %+.3f (conf=%.2f, agree=%.2f, usable=%s, llms=%d/%d, news=%d, prompt=%s)",
+            coin, sentiment, mean_confidence, agreement, usable,
+            len(scores), 3, news_count, self._prompt_version,
         )
         return result
 
-    def _empty_result(self, coin: str, individual: dict) -> SentimentResult:
+    def _empty_result(self, coin: str, individual: dict, news_count: int = 0) -> SentimentResult:
         return {
             "coin": coin,
             "sentiment": 0.0,
@@ -428,6 +526,8 @@ class SentimentAnalyzer:
             "individual_scores": individual,
             "usable": False,
             "timestamp": time.time(),
+            "news_count": news_count,
+            "prompt_version": self._prompt_version,
         }
 
     # ------------------------------------------------------------------
@@ -438,25 +538,78 @@ class SentimentAnalyzer:
         tasks = {coin: self.get_sentiment(news, coin) for coin, news in news_map.items()}
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
         return {
-            coin: (r if not isinstance(r, Exception) else self._empty_result(coin, {}))
+            coin: (
+                r if not isinstance(r, Exception)
+                else self._empty_result(coin, {}, news_count=len(news_map.get(coin, [])))
+            )
             for coin, r in zip(tasks.keys(), results)
         }
 
+    def _log_sentiment(self, result: SentimentResult) -> None:
+        """Append a sentiment result to logs/sentiment_YYYYMMDD.jsonl.
+
+        Each line is a self-contained JSON object with key metrics.
+        Full individual_scores are included for post-analysis.
+
+        Args:
+            result: Completed SentimentResult to log.
+        """
+        try:
+            self.LOG_DIR.mkdir(parents=True, exist_ok=True)
+            today = datetime.now(timezone.utc).strftime("%Y%m%d")
+            log_file = self.LOG_DIR / f"sentiment_{today}.jsonl"
+
+            # Build compact log record (avoid huge nested objects)
+            individual_compact = {
+                provider: {
+                    "sentiment": score.get("sentiment", 0.0),
+                    "confidence": score.get("confidence", 0.0),
+                    "reasoning": score.get("reasoning", ""),
+                    "key_events": score.get("key_events", []),
+                    "risk_factors": score.get("risk_factors", []),
+                }
+                for provider, score in result.get("individual_scores", {}).items()
+            }
+
+            record = {
+                "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "coin": result["coin"],
+                "sentiment": result["sentiment"],
+                "confidence": result["confidence"],
+                "agreement": result["agreement"],
+                "usable": result["usable"],
+                "llm_count": len(result.get("individual_scores", {})),
+                "news_count": result.get("news_count", 0),
+                "prompt_version": result.get("prompt_version", "v1"),
+                "individual": individual_compact,
+            }
+
+            with open(log_file, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        except Exception as exc:
+            logger.warning("Failed to write sentiment log: %s", exc)
+
     def _parse_llm_response(self, content: str) -> dict:
         """Extract JSON from LLM response text.
+
+        Supports both v1 (sentiment, confidence, reasoning) and
+        v2 (+ key_events, risk_factors) prompt outputs.
 
         Args:
             content: Raw LLM output string.
 
         Returns:
-            Dict with keys ``sentiment``, ``confidence``, ``reasoning``.
+            Dict with keys: ``sentiment``, ``confidence``, ``reasoning``,
+            ``key_events``, ``risk_factors``.
 
         Raises:
             ValueError: When valid JSON with required keys cannot be found.
         """
         import re
 
-        # Extract JSON block (may have markdown fences)
+        # Extract JSON block (may have markdown fences like ```json ... ```)
+        # Try to find the outermost { ... } block
         match = re.search(r"\{.*?\}", content, re.DOTALL)
         if not match:
             raise ValueError(f"No JSON found in LLM response: {content[:100]}")
@@ -467,11 +620,21 @@ class SentimentAnalyzer:
         confidence = float(data.get("confidence", 0.5))
         reasoning = str(data.get("reasoning", ""))
 
+        # v2 fields (optional — empty list if not present)
+        key_events: list[str] = [str(e) for e in data.get("key_events", [])]
+        risk_factors: list[str] = [str(r) for r in data.get("risk_factors", [])]
+
         # Clamp to valid ranges
         sentiment = max(-1.0, min(1.0, sentiment))
         confidence = max(0.0, min(1.0, confidence))
 
-        return {"sentiment": sentiment, "confidence": confidence, "reasoning": reasoning}
+        return {
+            "sentiment": sentiment,
+            "confidence": confidence,
+            "reasoning": reasoning,
+            "key_events": key_events,
+            "risk_factors": risk_factors,
+        }
 
     def _save(self, coin: str, result: SentimentResult) -> None:
         try:
