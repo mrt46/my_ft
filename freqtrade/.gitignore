@@ -5,6 +5,10 @@ config*.json
 *.sqlite-wal
 logfile.txt
 user_data/*
+# Exception: our project-specific config and strategy files
+!user_data/config.json
+!user_data/strategies/
+!user_data/strategies/*.py
 !user_data/strategy/sample_strategy.py
 !user_data/notebooks
 !user_data/models
