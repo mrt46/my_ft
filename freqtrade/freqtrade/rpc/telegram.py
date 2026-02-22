@@ -308,6 +308,12 @@ class Telegram(RPCHandler):
             CommandHandler("tg_info", self._tg_info),
             CommandHandler("profit_long", self._profit_long),
             CommandHandler("profit_short", self._profit_short),
+            # Custom Grid Bot commands
+            CommandHandler("grid", self._cmd_grid),
+            CommandHandler("pnl", self._cmd_pnl),
+            CommandHandler("screener", self._cmd_screener),
+            CommandHandler(["sat", "sell"], self._cmd_sat),
+            CommandHandler("report", self._cmd_report),
         ]
         callbacks = [
             CallbackQueryHandler(self._status_table, pattern="update_status_table"),
@@ -1985,9 +1991,298 @@ class Telegram(RPCHandler):
             "Avg. holding durations for buys and sells.`\n"
             "*/help:* `This help message`\n"
             "*/version:* `Show version`\n"
+            "_Grid Bot Komutlari_\n"
+            "------------\n"
+            "*/grid:* `Grid seviyelerini goster (final_grid.json)`\n"
+            "*/pnl:* `P&L raporu: bugun ve toplam kar/zarar`\n"
+            "*/screener:* `Son screener sonuclarini goster`\n"
+            "*/sat <PAIR> [market]:* `Manuel satis. Ornek: /sat BTC market`\n"
+            "*/report:* `Tam durum raporu: pozisyonlar, P&L, grid ozeti`\n"
         )
 
         await self._send_msg(message, parse_mode=ParseMode.MARKDOWN)
+
+    # -------------------------------------------------------------------------
+    # Custom Grid Bot Commands
+    # -------------------------------------------------------------------------
+
+    @authorized_only
+    async def _cmd_grid(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /grid
+        Shows current grid levels from final_grid.json for all pairs.
+        """
+        import json as _json
+        from pathlib import Path as _Path
+
+        grid_file = _Path(__file__).parents[4] / "data" / "final_grid.json"
+        try:
+            if not grid_file.exists():
+                await self._send_msg(
+                    "*Grid:* `final_grid.json bulunamadi. Grid analizi henuz calistirilmadi.`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+
+            data = _json.loads(grid_file.read_text(encoding="utf-8"))
+            if not data:
+                await self._send_msg(
+                    "*Grid:* `Grid verisi bos. Grid analizi calistirin.`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+
+            lines = ["*GRID SEVIYELERI*", "```"]
+            for pair, gd in data.items():
+                levels = gd.get("levels", [])
+                pos_size = gd.get("position_size", "?")
+                upper = gd.get("upper_bound", 0)
+                lower = gd.get("lower_bound", 0)
+                spacing = gd.get("spacing", "?")
+                sentiment = gd.get("sentiment_score", None)
+                s_tag = ""
+                if sentiment is not None:
+                    s_tag = (
+                        " [+]" if sentiment > 0.1
+                        else (" [-]" if sentiment < -0.1 else " [=]")
+                    )
+                lines.append(
+                    f"{pair}{s_tag}: {len(levels)} seviye | "
+                    f"{pos_size} USDC | "
+                    f"{lower:.4f}-{upper:.4f} | "
+                    f"aralik={spacing}"
+                )
+            lines.append("```")
+            await self._send_msg("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        except Exception as exc:
+            logger.error("_cmd_grid error: %s", exc)
+            await self._send_msg(f"*Grid hatasi:* `{exc}`", parse_mode=ParseMode.MARKDOWN)
+
+    @authorized_only
+    async def _cmd_pnl(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /pnl
+        Shows P&L breakdown: today, this week, all-time.
+        Delegates to the existing _profit_handler with today's data.
+        """
+        try:
+            stake_cur = self._config["stake_currency"]
+            fiat_disp_cur = self._config.get("fiat_display_currency", "")
+            from datetime import date as _date, timedelta as _timedelta
+
+            # Today stats
+            today_start = datetime.combine(_date.today(), datetime.min.time())
+            stats_today = self._rpc._rpc_trade_statistics(
+                stake_currency=stake_cur,
+                fiat_display_currency=fiat_disp_cur,
+                start_date=today_start,
+            )
+            # All-time stats
+            stats_all = self._rpc._rpc_trade_statistics(
+                stake_currency=stake_cur,
+                fiat_display_currency=fiat_disp_cur,
+                start_date=datetime.fromtimestamp(0),
+            )
+
+            profit_today = stats_today.get("profit_closed_coin", 0.0)
+            profit_today_pct = stats_today.get("profit_factor", 0.0)
+            trades_today = stats_today.get("trade_count", 0)
+
+            profit_all = stats_all.get("profit_closed_coin", 0.0)
+            trades_all = stats_all.get("trade_count", 0)
+            win_rate = stats_all.get("winning_trades", 0)
+            loss_rate = stats_all.get("losing_trades", 0)
+            best_pair = stats_all.get("best_pair", {})
+
+            msg = (
+                f"*P&L RAPORU*\n"
+                f"```\n"
+                f"Bugun  : {profit_today:+.4f} {stake_cur} ({trades_today} islem)\n"
+                f"Toplam : {profit_all:+.4f} {stake_cur} ({trades_all} islem)\n"
+                f"Kazanan: {win_rate}  Kaybeden: {loss_rate}\n"
+            )
+            if best_pair:
+                msg += f"En iyi : {best_pair.get('key', '?')} {best_pair.get('profit_sum_pct', 0):.2f}%\n"
+            msg += "```"
+            await self._send_msg(msg, parse_mode=ParseMode.MARKDOWN)
+        except Exception as exc:
+            logger.error("_cmd_pnl error: %s", exc)
+            await self._send_msg(f"*PNL hatasi:* `{exc}`", parse_mode=ParseMode.MARKDOWN)
+
+    @authorized_only
+    async def _cmd_screener(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /screener
+        Shows last screener results from data/screener_queue.json.
+        """
+        import json as _json
+        from pathlib import Path as _Path
+
+        screener_file = _Path(__file__).parents[4] / "data" / "screener_queue.json"
+        try:
+            if not screener_file.exists():
+                await self._send_msg(
+                    "*Screener:* `screener_queue.json bulunamadi. "
+                    "Screener henuz calistirilmadi.`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+
+            data = _json.loads(screener_file.read_text(encoding="utf-8"))
+            candidates = data if isinstance(data, list) else data.get("candidates", [])
+
+            if not candidates:
+                await self._send_msg(
+                    "*Screener:* `Bekleyen aday yok.`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+
+            lines = [f"*SCREENER SONUCLARI* ({len(candidates)} aday)", "```"]
+            for c in candidates[:10]:  # max 10
+                pair = c.get("pair", "?")
+                score = c.get("score", 0)
+                price = c.get("price", 0)
+                rsi_4h = c.get("rsi_4h", 0)
+                volume = c.get("volume", 0)
+                lines.append(
+                    f"{pair}: skor={score} | fiyat={price:.6f} | "
+                    f"RSI4h={rsi_4h:.1f} | hacim=${volume/1e6:.1f}M"
+                )
+            lines.append("```")
+            await self._send_msg("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        except Exception as exc:
+            logger.error("_cmd_screener error: %s", exc)
+            await self._send_msg(f"*Screener hatasi:* `{exc}`", parse_mode=ParseMode.MARKDOWN)
+
+    @authorized_only
+    async def _cmd_sat(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /sat <PAIR> [market|<profit_pct>]
+        Manual sell command. Example: /sat BTC market  or  /sat BTC +20
+        Triggers a force-exit on the open trade for the given pair.
+        """
+        args = context.args or []
+        if not args:
+            await self._send_msg(
+                "*Kullanim:* `/sat PAIR market` veya `/sat PAIR +20`\n"
+                "Ornek: `/sat BTC market`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        pair_arg = args[0].upper()
+        # Normalize pair: add /USDC if not present
+        if "/" not in pair_arg:
+            pair_arg = f"{pair_arg}/USDC"
+
+        amount_arg = args[1].lower() if len(args) > 1 else "market"
+
+        try:
+            # Find open trade for this pair
+            open_trades = Trade.get_trades_proxy(is_open=True)
+            trade = next((t for t in open_trades if t.pair == pair_arg), None)
+
+            if trade is None:
+                await self._send_msg(
+                    f"*Sat:* `{pair_arg} icin acik pozisyon bulunamadi.`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+
+            if amount_arg == "market":
+                # Force exit at market price
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    safe_async_db(self._rpc._rpc_force_exit),
+                    str(trade.id),
+                )
+                await self._send_msg(
+                    f"*Sat:* `{pair_arg} market fiyatindan satildi (trade #{trade.id})`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            else:
+                # Show current profit and confirm
+                current_profit = trade.calc_profit_ratio(trade.open_rate)
+                await self._send_msg(
+                    f"*Sat:* `{pair_arg} - Mevcut kar: {current_profit*100:+.2f}%`\n"
+                    f"Market satis icin: `/sat {args[0]} market`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+        except RPCException as exc:
+            await self._send_msg(f"*Sat hatasi:* `{exc}`", parse_mode=ParseMode.MARKDOWN)
+        except Exception as exc:
+            logger.error("_cmd_sat error: %s", exc)
+            await self._send_msg(f"*Sat hatasi:* `{exc}`", parse_mode=ParseMode.MARKDOWN)
+
+    @authorized_only
+    async def _cmd_report(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /report
+        Sends a full status report: open trades, P&L, grid summary.
+        """
+        import json as _json
+        from pathlib import Path as _Path
+
+        try:
+            stake_cur = self._config["stake_currency"]
+            dry_run = self._config.get("dry_run", False)
+            mode = "DRY-RUN" if dry_run else "CANLI"
+
+            # Open trades
+            open_trades = Trade.get_trades_proxy(is_open=True)
+            trade_lines = []
+            for t in open_trades:
+                profit = t.calc_profit_ratio(t.open_rate)
+                trade_lines.append(
+                    f"  {t.pair}: {profit*100:+.2f}% | {t.stake_amount:.2f} {stake_cur}"
+                )
+
+            # P&L stats
+            stats = self._rpc._rpc_trade_statistics(
+                stake_currency=stake_cur,
+                fiat_display_currency=self._config.get("fiat_display_currency", ""),
+                start_date=datetime.fromtimestamp(0),
+            )
+            profit_all = stats.get("profit_closed_coin", 0.0)
+            trades_all = stats.get("trade_count", 0)
+
+            # Grid summary
+            grid_file = _Path(__file__).parents[4] / "data" / "final_grid.json"
+            grid_pairs = []
+            if grid_file.exists():
+                gdata = _json.loads(grid_file.read_text(encoding="utf-8"))
+                grid_pairs = list(gdata.keys())
+
+            lines = [
+                f"*BOT DURUM RAPORU*",
+                f"```",
+                f"Mod    : {mode}",
+                f"Strateji: DynamicGridStrategy",
+                f"Zaman  : {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}",
+                f"",
+                f"ACIK POZISYONLAR ({len(open_trades)} adet):",
+            ]
+            if trade_lines:
+                lines.extend(trade_lines)
+            else:
+                lines.append("  Acik pozisyon yok")
+
+            lines += [
+                f"",
+                f"P&L OZETI:",
+                f"  Toplam kapali islem: {trades_all}",
+                f"  Toplam kar/zarar: {profit_all:+.4f} {stake_cur}",
+                f"",
+                f"GRID DOSYASI:",
+                f"  Yuklenen coinler: {', '.join(grid_pairs) if grid_pairs else 'Yok'}",
+                f"```",
+            ]
+            await self._send_msg("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        except Exception as exc:
+            logger.error("_cmd_report error: %s", exc)
+            await self._send_msg(f"*Rapor hatasi:* `{exc}`", parse_mode=ParseMode.MARKDOWN)
 
     @authorized_only
     async def _health(self, update: Update, context: CallbackContext) -> None:
