@@ -595,7 +595,7 @@ class SentimentAnalyzer:
         lines = [
             f"{emoji} SENTIMENT: {coin}",
             f"========================",
-            f"Skor    : {score:+.3f}  [{usable_tag}]",
+            f"Skor    : {score:+.3f}  ({usable_tag})",
             f"Guven   : {conf:.2f}  Uzlasma: {agree:.2f}",
             f"Haberler: {news_count} adet  Prompt: {result.get('prompt_version','v1')}",
             f"",

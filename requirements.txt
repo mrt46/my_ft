@@ -19,10 +19,13 @@ numpy==1.26.3
 ta-lib==0.4.28
 
 # --- AI / LLM ---
-openai==1.12.0
-google-generativeai==0.3.2
-aiohttp==3.9.3
-requests==2.31.0
+openai>=1.12.0
+google-genai>=1.0.0
+aiohttp>=3.9.3
+requests>=2.31.0
+
+# --- News Fetching ---
+feedparser>=6.0.10
 
 # --- Async & Scheduling ---
 APScheduler==3.10.4

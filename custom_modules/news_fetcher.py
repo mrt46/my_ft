@@ -337,7 +337,7 @@ class NewsFetcher:
 
     async def _fetch_newsapi(self, coin: str, hours: int) -> list[NewsArticle]:
         """Fetch from NewsAPI."""
-        from_date = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d")
+        from_date = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d")
 
         params = {
             "q": f"{coin} crypto",
