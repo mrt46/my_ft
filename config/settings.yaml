@@ -22,7 +22,8 @@ capital:
 grid:
   analysis_interval_hours: 2
   ema_update_interval_hours: 4    # EMA200 güncelleme sıklığı
-  max_coins: 10
+  max_coins: 5                    # Sabit 5 coin (coins.yaml grid_coins listesi)
+  use_fixed_coins: true           # true = coins.yaml'dan oku, false = dinamik volume sıralaması
   sr_lookback_hours: 72           # S/R hesaplama penceresi
   sr_merge_threshold_pct: 0.3     # Yakın S/R seviyelerini birleştir
   sr_price_bin_pct: 0.5           # Volume profil bin büyüklüğü (fiyatın %'si, 0.5 = %0.5)
@@ -32,9 +33,11 @@ grid:
 screener:
   run_time_utc: "00:00"
   volume_min_24h: 5_000_000       # 5M USDC minimum hacim
+  rsi_1h_threshold: 40            # 1h RSI eşiği (yeni)
   rsi_4h_threshold: 35
   rsi_1d_threshold: 30
   ema200_period: 200
+  ema_timeframes: [1h, 4h, 1d]   # Tüm bu TF'lerde EMA200 altında olmalı
   min_score: 40
   top_n: 5
   manual_approval_days: 30        # İlk 30 gün manuel onay

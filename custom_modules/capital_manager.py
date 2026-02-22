@@ -409,40 +409,49 @@ class CapitalManager:
     # ------------------------------------------------------------------
 
     def get_tier_allocation(self, rank: int) -> dict:
-        """Calculate tier-based capital allocation for grid trading.
+        """Calculate tier-based capital allocation for 5 fixed grid coins.
 
-        Tier 1 (Rank 0-2): Large Cap - 40% of grid capital, 10 levels
-        Tier 2 (Rank 3-5): Mid Cap - 30% of grid capital, 8 levels
-        Tier 3 (Rank 6-9): Small Cap - 20% of grid capital, 6 levels
+        5 coin, 600 USDC grid bütçesi:
+          Tier 1 (rank 0-1): %40 = 240 USDC / 2 coin = 120 USDC/coin → 12 USDC/seviye (10 seviye)
+          Tier 2 (rank 2-3): %35 = 210 USDC / 2 coin = 105 USDC/coin → 13 USDC/seviye  (8 seviye)
+          Tier 3 (rank 4)  : %25 = 150 USDC / 1 coin = 150 USDC/coin → 25 USDC/seviye  (6 seviye)
+          Toplam: 240 + 210 + 150 = 600 USDC ✓
 
         Args:
-            rank: Volume ranking (0-9)
+            rank: Coin index in coins.yaml grid_coins list (0-4)
 
         Returns:
-            Dict with tier, allocation_pct, grid_levels, per_level_usdc
+            Dict with tier, allocation_pct, coins_in_tier, grid_levels,
+            per_coin_usdc, per_level_usdc, total_allocation
         """
-        grid_capital = self._total_usdc * 0.6  # 60% for grid
+        grid_capital = self._total_usdc * 0.6  # 60% = 600 USDC
 
-        if rank < 3:
+        if rank <= 1:       # rank 0,1 → Tier 1 (ilk 2 coin)
             tier = 1
             allocation_pct = 0.40
+            coins_in_tier = 2
             grid_levels = 10
-        elif rank < 6:
+        elif rank <= 3:     # rank 2,3 → Tier 2 (3-4. coin)
             tier = 2
-            allocation_pct = 0.30
+            allocation_pct = 0.35
+            coins_in_tier = 2
             grid_levels = 8
-        else:
+        else:               # rank 4   → Tier 3 (5. coin)
             tier = 3
-            allocation_pct = 0.20
+            allocation_pct = 0.25
+            coins_in_tier = 1
             grid_levels = 6
 
-        tier_allocation = grid_capital * allocation_pct
-        per_level = tier_allocation / grid_levels
+        tier_total = grid_capital * allocation_pct
+        per_coin = tier_total / coins_in_tier
+        per_level = per_coin / grid_levels
 
         return {
             "tier": tier,
             "allocation_pct": allocation_pct,
+            "coins_in_tier": coins_in_tier,
             "grid_levels": grid_levels,
+            "per_coin_usdc": round(per_coin, 2),
             "per_level_usdc": round(per_level, 2),
-            "total_allocation": round(tier_allocation, 2),
+            "total_allocation": round(tier_total, 2),
         }

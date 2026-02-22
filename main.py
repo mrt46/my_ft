@@ -178,10 +178,10 @@ class BotOrchestrator:
     # ------------------------------------------------------------------
 
     async def run_grid_analysis(self) -> None:
-        """Run the 2-hour grid analysis cycle with top volume pairs.
+        """Run the 2-hour grid analysis cycle with fixed coins.yaml pairs.
 
         Steps:
-            1. Get top 10 volume pairs from Binance
+            1. Load fixed 5 pairs from config/coins.yaml
             2. Analyze each pair with tier-based grid levels
             3. Fetch news and sentiment for each coin
             4. Merge grids with sentiment (GridFusion → final_grid.json)
@@ -189,11 +189,11 @@ class BotOrchestrator:
         """
         logger.info("=== Grid Analysis Cycle START ===")
         try:
-            # Step 1: Get top 10 volume pairs
+            # Step 1: Load fixed coin list from coins.yaml
             top_pairs = await asyncio.to_thread(
-                self.grid_analyzer.get_top_volume_pairs, top_n=10
+                self.grid_analyzer.get_top_volume_pairs, top_n=5
             )
-            logger.info(f"Top 10 volume pairs selected: {top_pairs}")
+            logger.info(f"Fixed grid coins ({len(top_pairs)}): {top_pairs}")
 
             # Step 2: Analyze each pair with tier-based grid levels
             base_grids: dict[str, any] = {}
@@ -204,9 +204,9 @@ class BotOrchestrator:
                     )
                     base_grids[pair] = grid
 
-                    # Log tier info
-                    tier = (rank // 3) + 1
-                    logger.info(f"{pair}: Tier {tier}, {len(grid['levels'])} levels")
+                    # Log tier info (5-coin system)
+                    tier = 1 if rank <= 1 else (2 if rank <= 3 else 3)
+                    logger.info(f"{pair}: Tier {tier} (rank {rank}), {len(grid['levels'])} levels")
                 except Exception as exc:
                     logger.error(f"Failed to analyze {pair}: {exc}")
 
