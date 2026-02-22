@@ -1,0 +1,110 @@
+# ============================================================
+# settings.yaml — Global Bot Configuration
+# Tüm ayarlar burada. Hardcoded value yasak!
+# ============================================================
+
+bot:
+  name: "Akilli Grid Trading Bot"
+  version: "1.0.0"
+  dry_run: true           # ALWAYS true başla, canlıda false yap
+  log_level: "INFO"
+
+# --- Capital Management ---
+capital:
+  total_usdc: 1000
+  grid_min_reserve: 600           # Grid için minimum rezerv
+  screener_max_per_position: 100  # Screener pozisyon maksimumu
+  screener_min_per_position: 20   # Screener pozisyon minimumu
+  low_balance_alert_threshold: 100  # Alert if available < 100 USDC
+  deposit_detection_threshold: 50   # Yeni deposit algılama eşiği
+
+# --- Grid Trading ---
+grid:
+  analysis_interval_hours: 2
+  ema_update_interval_hours: 4    # EMA200 güncelleme sıklığı
+  max_coins: 10
+  sr_lookback_hours: 72           # S/R hesaplama penceresi
+  sr_merge_threshold_pct: 0.3     # Yakın S/R seviyelerini birleştir
+  sr_price_bin_pct: 0.5           # Volume profil bin büyüklüğü (fiyatın %'si, 0.5 = %0.5)
+  sr_wick_multiplier: 2.0         # Rejection wick eşiği
+
+# --- Screener ---
+screener:
+  run_time_utc: "00:00"
+  volume_min_24h: 5_000_000       # 5M USDC minimum hacim
+  rsi_4h_threshold: 35
+  rsi_1d_threshold: 30
+  ema200_period: 200
+  min_score: 40
+  top_n: 5
+  manual_approval_days: 30        # İlk 30 gün manuel onay
+  auto_buy_score_threshold: 80    # 30 gün sonra auto-buy eşiği
+
+# --- Screener Exit (Hybrid) ---
+exit:
+  ema_portion: 0.40         # EMA touch'ta %40 sat
+  ladder_1_pct: 0.15        # +15%
+  ladder_1_portion: 0.30    # %30 sat
+  ladder_2_pct: 0.18        # +18%
+  ladder_2_portion: 0.20    # %20 sat
+  ladder_3_pct: 0.20        # +20%
+  ladder_3_portion: 0.10    # %10 sat
+  stop_loss_pct: -0.05      # -5% stop loss
+  ema_order_offset: 0.998   # EMA fiyatının %0.2 altına limit koy
+
+# --- BNB Manager ---
+bnb:
+  auto_buy_threshold_usdc: 1.0    # BNB < 1 USDC olunca al
+  auto_buy_amount_usdc: 5.0       # 5 USDC değerinde BNB al
+  check_interval_minutes: 15
+
+# --- Health Check ---
+health:
+  interval_seconds: 30
+  freqtrade_check: true
+  websocket_check: true
+
+# --- Telegram ---
+telegram:
+  proposal_timeout_hours: 24
+  max_message_length: 4096
+  parse_mode: "HTML"
+
+# --- News Fetcher ---
+news:
+  cache_ttl_minutes: 30           # News cache süresi
+  fetch_timeout_seconds: 10       # API timeout
+  max_articles_per_coin: 10       # Coin başına max haber
+
+# --- Sentiment Analyzer ---
+sentiment:
+  llm_timeout_seconds: 30
+  min_confidence: 0.6             # Confidence < 0.6 → sentiment ignore
+  min_llms_required: 2            # En az 2 LLM başarılı olmalı
+  news_batch_size: 10
+  weight_deepseek: 0.35
+  weight_gpt4o: 0.35
+  weight_gemini: 0.30
+
+# --- API ---
+api:
+  binance_rate_limit_per_min: 1200
+  cache_ttl_seconds: 3600         # 1 saat
+  retry_max_attempts: 5
+  retry_base_wait_seconds: 1
+  rate_limit_wait_seconds: 60
+
+# --- Logging ---
+logging:
+  rotate_daily: true
+  max_bytes: 52428800             # 50 MB
+  backup_count: 7                 # 7 gün
+  format: "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s"
+  date_format: "%Y-%m-%d %H:%M:%S"
+
+# --- Risk Manager (Circuit Breaker) ---
+risk:
+  max_daily_loss_pct: -5.0        # Günlük -5% → trading durdur
+  max_consecutive_losses: 5
+  max_open_positions: 15
+  circuit_breaker_cooldown_hours: 4

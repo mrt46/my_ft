@@ -1,0 +1,36 @@
+{
+  "timestamp": "2026-02-22T15:52:02.962389+00:00",
+  "uptime_seconds": 1878.0,
+  "dry_run": true,
+  "bot_status": "running",
+  "exchange": {
+    "status": "healthy",
+    "latency_ms": 692.8,
+    "timestamp": 1771775522.96211
+  },
+  "risk": {
+    "status": "healthy",
+    "circuit_breaker": false,
+    "consecutive_losses": 0,
+    "daily_pnl_pct": 0.0,
+    "open_positions": 0,
+    "details": {
+      "daily_pnl_usdc": 0.0,
+      "max_daily_loss_pct": -5.0,
+      "max_consecutive_losses": 5,
+      "max_open_positions": 15,
+      "paused_reason": "",
+      "available_usdc": 1000
+    }
+  },
+  "balance": {
+    "total_usdc": 1000,
+    "grid_locked": 0,
+    "screener_locked": 0,
+    "available": 1000
+  },
+  "last_grid_analysis": "2026-02-22T15:23:44.973036+00:00",
+  "last_screener": "2026-02-22T15:25:06.688517+00:00",
+  "last_ema_update": "2026-02-22T15:23:44.975187+00:00",
+  "heartbeat_count": 55
+}

@@ -1,0 +1,48 @@
+# ============================================================
+# .gitignore
+# ============================================================
+
+# API Keys — ASLA commit etme!
+.env
+config/api_keys.env
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Data files (runtime generated)
+data/*.json
+logs/*.log
+logs/*.log.*
+
+# Freqtrade runtime
+freqtrade/user_data/backtest_results/
+freqtrade/user_data/hyperopt_results/
+freqtrade/user_data/data/
+freqtrade/user_data/logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Jupyter
+*.ipynb_checkpoints/

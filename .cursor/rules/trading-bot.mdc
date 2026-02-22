@@ -1,0 +1,541 @@
+---
+alwaysApply: true
+description: Akıllı Grid Trading Bot - Proje standartları, mimari ve kodlama kuralları
+---
+
+# PROJE: Akıllı Grid Trading Bot (Binance)
+
+## GENEL BAKIŞ
+
+Bu proje, Binance üzerinde çalışan, AI destekli, dinamik grid trading botudur.
+
+- **Capital:** 1000 USDC (tek wallet)
+- **Pairs:** Top 10 Binance coins + günlük screener fırsatları
+- **Platform:** Freqtrade + Custom Python modules
+- **AI:** DeepSeek v3 + GPT-4o Mini + Gemini 2.0 Flash
+
+Tam sistem tasarımı: [docs/system_design_v2.md](mdc:docs/system_design_v2.md)
+
+---
+
+## TEKNOLOJİ STACK
+
+- Python 3.10+
+- Freqtrade 2024.x (latest stable)
+- CCXT (Binance API)
+- python-telegram-bot 20.x
+- Pandas, NumPy, TA-Lib
+- AsyncIO
+- APScheduler (cron jobs)
+- Redis (optional caching)
+
+---
+
+## PROJE YAPISI
+
+```
+project/
+├── freqtrade/user_data/
+│   ├── config.json
+│   └── strategies/DynamicGridStrategy.py
+│
+├── custom_modules/
+│   ├── __init__.py
+│   ├── api_wrapper.py        # Resilient API wrapper (FOUNDATION)
+│   ├── capital_manager.py    # Balance allocation logic
+│   ├── bnb_manager.py        # BNB auto-buy (fee optimizer)
+│   ├── grid_analyzer.py      # Technical analysis (S/R, Fib, Volume)
+│   ├── sentiment_analyzer.py # AI sentiment (3-LLM ensemble)
+│   ├── grid_fusion.py        # Grid + Sentiment merge
+│   ├── screener.py           # Daily crypto screener
+│   ├── hybrid_exit.py        # EMA + ladder exit strategy
+│   ├── telegram_bot.py       # Interactive Telegram bot
+│   └── risk_manager.py       # Circuit breaker
+│
+├── data/
+│   ├── base_grid.json        # Technical grids
+│   ├── sentiment_scores.json
+│   ├── final_grid.json       # Merged grids (Freqtrade input)
+│   ├── screener_queue.json   # Pending screener trades
+│   └── positions.json        # All open positions
+│
+├── config/
+│   ├── api_keys.env
+│   ├── coins.yaml
+│   └── settings.yaml
+│
+├── logs/
+│   ├── trades.log
+│   ├── analysis.log
+│   ├── api_errors.log
+│   └── telegram.log
+│
+├── scripts/
+│   ├── run_analysis.sh       # 2-hour cron job
+│   ├── run_screener.sh       # Daily 00:00 UTC cron
+│   ├── health_check.sh       # 30-second health check
+│   └── emergency_stop.sh     # Manual kill switch
+│
+├── tests/
+│   ├── test_grid_analyzer.py
+│   ├── test_sentiment.py
+│   ├── test_screener.py
+│   └── test_capital_manager.py
+│
+├── requirements.txt
+├── .env.example
+├── README.md
+└── main.py
+```
+
+---
+
+## CODING STANDARDS
+
+### 1. PYTHON STYLE
+- PEP 8 compliant
+- Type hints: Python 3.10+ syntax
+- Docstrings: Google style
+- Max line length: 100 chars
+- f-strings for formatting (not `%` or `.format()`)
+- `pathlib` kullan (not `os.path`)
+
+### 2. ERROR HANDLING
+
+Her API call mutlaka try-except içinde olmalı:
+
+```python
+try:
+    data = exchange.fetch_ohlcv(symbol)
+except ccxt.RateLimitError:
+    logger.warning("Rate limit, waiting...")
+    time.sleep(60)
+    raise  # Retry için
+except ccxt.NetworkError as e:
+    logger.error(f"Network error: {e}")
+    return fallback_cached_data(symbol)
+except Exception as e:
+    logger.critical(f"Unexpected error: {e}")
+    telegram_alert(f"🚨 Critical: {e}")
+    raise
+```
+
+### 3. LOGGING
+
+```python
+import logging
+logger = logging.getLogger(__name__)
+
+# Log format:
+# 2025-02-21 14:30:45 [INFO]    grid_analyzer: BTC/USDC S/R calculated
+# 2025-02-21 14:31:12 [ERROR]   api_wrapper: Binance timeout, using cache
+# 2025-02-21 14:35:00 [WARNING] capital_manager: Low balance (150 USDC)
+```
+
+### 4. CONFIGURATION
+- Hiçbir hardcoded value olmasın
+- Tüm settings `config/settings.yaml`'da
+- API keys sadece `.env` dosyasında
+- `.env.example` ile template ver
+
+### 5. ASYNC/AWAIT
+
+```python
+# Telegram bot ve WebSocket için async
+async def send_telegram_message(text: str):
+    await bot.send_message(chat_id=CHAT_ID, text=text)
+
+# Blocking IO için asyncio.to_thread kullan
+async def fetch_data_async(symbol: str):
+    return await asyncio.to_thread(exchange.fetch_ohlcv, symbol)
+```
+
+### 6. DATA STRUCTURES
+
+TypedDict kullan (Python 3.10+):
+
+```python
+from typing import TypedDict
+
+class GridConfig(TypedDict):
+    upper_bound: float
+    lower_bound: float
+    levels: list[float]
+    spacing: str
+    position_size: float
+
+class ScreenerCandidate(TypedDict):
+    pair: str
+    price: float
+    rsi_4h: float
+    rsi_1d: float
+    ema200: float
+    distance_pct: float
+    volume: float
+    score: int
+```
+
+### 7. TESTING
+- Her critical function için unit test
+- Mock external APIs (Binance, OpenAI, vb.)
+- Test coverage minimum 70%
+- Pytest kullan
+
+---
+
+## MODÜL KURALLARI
+
+### grid_analyzer.py
+
+```python
+def calculate_support_resistance(df: pd.DataFrame) -> list[float]:
+    """
+    Son 72 saatlik data'dan S/R seviyeleri hesapla.
+
+    Args:
+        df: OHLCV DataFrame (minimum 4320 rows for 72h @ 1m)
+
+    Returns:
+        Sorted list of S/R levels
+
+    Algorithm:
+        1. Price touch frequency (100 USDC bins)
+        2. Volume profile (POC)
+        3. Rejection wicks (>2x body)
+        4. Merge close levels (<0.3% threshold)
+    """
+```
+
+### sentiment_analyzer.py
+
+```python
+async def get_llm_sentiment(news_batch: list[str], coin: str) -> dict:
+    """
+    3-LLM ensemble için paralel API calls.
+
+    Returns:
+        {'sentiment': float, 'confidence': float, 'agreement': float, 'individual_scores': {...}}
+
+    Error handling:
+        - LLM timeout: 30 seconds
+        - Fallback: 2/3 LLM yeterli
+        - Confidence < 0.6: Ignore sentiment
+    """
+    tasks = [call_deepseek(...), call_gpt4o(...), call_gemini(...)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+```
+
+### screener.py
+
+```python
+def daily_screener() -> list[ScreenerCandidate]:
+    """
+    Tüm Binance USDC pairs'i tara.
+
+    Criteria (Esnek):
+        - Volume > 5M USDC (24h)
+        - (RSI_4h < 35 OR RSI_1d < 30)
+        - Price < EMA200(1D)
+        - Score > 40
+
+    Returns:
+        Top 5 candidates sorted by score
+
+    Timing:
+        - Run at 00:00 UTC daily
+        - Execution time: ~2-3 minutes
+    """
+```
+
+### capital_manager.py
+
+```python
+def check_available_balance() -> float:
+    """
+    Gerçek zamanlı bakiye kontrolü.
+
+    Logic:
+        available = total_usdc - grid_locked - screener_locked
+
+    Side effects:
+        - Cache update (Redis)
+        - Telegram alert if available < 100 USDC
+    """
+```
+
+### telegram_bot.py
+
+```python
+async def send_screener_proposal(candidate: ScreenerCandidate, amount: float):
+    """
+    İnteraktif Telegram bildirimi.
+
+    Features:
+        - Inline keyboard: [✅ AL] [❌ REDDET] [📊 DETAY]
+        - 24-hour timeout
+        - Callback handling
+
+    Manual approval mode:
+        - First 30 days: Always ask
+        - After: Auto-buy if score > 80
+    """
+```
+
+### api_wrapper.py
+
+```python
+@retry(max_attempts=5, backoff='exponential')
+def resilient_api_call(func, *args, **kwargs):
+    """
+    Tüm API calls için retry decorator.
+
+    Retry strategy:
+        - NetworkError: Exponential backoff (1s, 2s, 4s, 8s, 16s)
+        - RateLimitError: Wait 60s, then retry
+        - TimeoutError: Retry with 2x timeout
+        - Other: Raise immediately
+
+    Fallback:
+        - Use cached data if < 1 hour old
+        - Telegram alert on cache usage
+    """
+```
+
+---
+
+## API KEYS & SECRETS
+
+`.env` format:
+
+```env
+# Binance
+BINANCE_API_KEY=your_key
+BINANCE_API_SECRET=your_secret
+
+# LLM APIs
+DEEPSEEK_API_KEY=your_key
+OPENAI_API_KEY=your_key
+GEMINI_API_KEY=your_key
+
+# Telegram
+TELEGRAM_BOT_TOKEN=your_token
+TELEGRAM_CHAT_ID=your_chat_id
+
+# Redis (optional)
+REDIS_URL=redis://localhost:6379
+```
+
+**Security:**
+- `.env` ASLA git commit edilmemeli
+- API keys rotate edilebilir olmalı
+- Binance API: Read + Trade permissions (NO Withdraw)
+
+---
+
+## PERFORMANCE
+
+- Binance API calls minimize et (rate limit: 1200/min)
+- Parallel requests: `asyncio.gather()`
+- Cache frequently accessed data (Redis)
+- Pandas vectorization (loop'lar yerine)
+- Max DataFrame size: 10k rows
+- Old logs rotate (daily)
+- JSON files max 1MB
+
+---
+
+## MONITORING
+
+### health_check.py
+
+```python
+def health_check() -> dict:
+    """
+    Her 30 saniyede bir.
+
+    Checks:
+        - Binance API reachable
+        - WebSocket connected
+        - Freqtrade running
+        - Sufficient balance
+        - Open positions count
+
+    Returns:
+        {'status': 'healthy' | 'degraded' | 'critical', 'details': {...}}
+    """
+```
+
+### Telegram Alert Seviyeleri
+- 🟢 **INFO:** Trade executed, daily report
+- 🟡 **WARNING:** Low balance, cached data used
+- 🔴 **ERROR:** API failure, invalid order
+- 🚨 **CRITICAL:** System down, circuit breaker
+
+---
+
+## DEPLOYMENT
+
+### Cron Jobs
+
+```cron
+# Grid analysis (every 2 hours)
+0 */2 * * * /path/to/scripts/run_analysis.sh
+
+# Screener (daily at 00:00 UTC)
+0 0 * * * /path/to/scripts/run_screener.sh
+
+# Health check (every 30 seconds)
+* * * * * /path/to/scripts/health_check.sh
+* * * * * sleep 30; /path/to/scripts/health_check.sh
+
+# Daily report (00:05 UTC)
+5 0 * * * python -m custom_modules.telegram_bot send_daily_report
+```
+
+### Systemd Service
+
+```ini
+[Unit]
+Description=Akıllı Grid Trading Bot
+After=network.target
+
+[Service]
+Type=simple
+User=trader
+WorkingDirectory=/home/trader/trading-bot
+ExecStart=/usr/bin/python3 main.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+---
+
+## DEPENDENCIES (requirements.txt)
+
+```
+# Core
+freqtrade==2024.2
+ccxt==4.2.25
+python-telegram-bot==20.7
+pandas==2.2.0
+numpy==1.26.3
+ta-lib==0.4.28
+
+# AI
+openai==1.12.0
+google-generativeai==0.3.2
+
+# Utils
+python-dotenv==1.0.0
+pyyaml==6.0.1
+requests==2.31.0
+aiohttp==3.9.3
+APScheduler==3.10.4
+
+# Optional
+redis==5.0.1
+psutil==5.9.8
+
+# Dev
+pytest==8.0.0
+pytest-asyncio==0.23.5
+black==24.2.0
+flake8==7.0.0
+mypy==1.8.0
+```
+
+---
+
+## GIT WORKFLOW
+
+### Branch Strategy
+```
+main (production)
+└── develop (staging)
+    ├── feature/grid-analyzer
+    ├── feature/sentiment-ai
+    ├── feature/screener
+    └── feature/telegram-bot
+```
+
+### Commit Messages
+```
+feat: Add crypto screener with RSI filters
+fix: Handle Binance rate limit in api_wrapper
+refactor: Optimize grid fusion algorithm
+docs: Update README with deployment steps
+test: Add unit tests for capital_manager
+```
+
+### .gitignore
+```gitignore
+.env
+venv/
+__pycache__/
+*.pyc
+data/*.json
+logs/*.log
+freqtrade/user_data/backtest_results/
+freqtrade/user_data/hyperopt_results/
+.vscode/
+.idea/
+.DS_Store
+```
+
+---
+
+## ÖNEMLİ KURALLAR (ASLA İHLAL ETME)
+
+1. **ASLA** hardcoded API key kullanma
+2. **Her** external call retry mechanism ile wrap et
+3. **Tüm** para hareketleri log'lanmalı
+4. **Critical errors** Telegram'a bildirilmeli
+5. **Bakiye kontrolü** her trade öncesi yapılmalı
+6. **EMA200** günde 6 kez güncellenmeli (her 4 saatte)
+7. **Screener sonuçları** ilk 30 gün manuel onay
+8. **Grid + Screener** aynı wallet, dinamik allocation
+9. **BNB balance < 1 USDC** → Auto-buy 5 USDC
+10. **Stop-loss** her screener pozisyonu için -5%
+
+---
+
+## MODÜL YAZIM SIRASI
+
+Modülleri bu sırayla yaz (her biri bir öncekine bağımlı):
+
+1. `api_wrapper.py` — Foundation (retry, cache, health)
+2. `capital_manager.py` — Balance allocation
+3. `bnb_manager.py` — BNB auto-buy
+4. `grid_analyzer.py` — Technical analysis
+5. `sentiment_analyzer.py` — 3-LLM ensemble
+6. `grid_fusion.py` — Grid + Sentiment merge
+7. `screener.py` — Daily opportunity scanner
+8. `hybrid_exit.py` — EMA + ladder exits
+9. `telegram_bot.py` — Interactive notifications
+10. `risk_manager.py` — Circuit breaker
+11. `DynamicGridStrategy.py` — Freqtrade strategy
+12. `main.py` — Orchestrator
+
+**Her modül için şunlar şart:**
+- Type hints
+- Google-style docstrings
+- Error handling (try/except)
+- Logging (`logger = logging.getLogger(__name__)`)
+- Unit tests (`tests/test_<module>.py`)
+
+---
+
+## BAŞLANGIÇ KOMUTU
+
+```bash
+git clone [repo-url] && cd trading-bot
+python3.10 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env  # API keylerini doldur
+python -m pytest tests/
+python main.py --dry-run  # Test
+python main.py            # Production
+```
