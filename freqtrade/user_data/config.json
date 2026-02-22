@@ -43,10 +43,7 @@
             "SOL/USDC",
             "XRP/USDC"
         ],
-        "pair_blacklist": [
-            "BNB/BTC",
-            "BNB/ETH"
-        ]
+        "pair_blacklist": []
     },
     "pairlists": [
         {

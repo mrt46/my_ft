@@ -381,7 +381,13 @@ class Screener:
     # ------------------------------------------------------------------
 
     def _get_all_usdc_pairs(self) -> list[str]:
-        """Binance'deki tüm aktif USDC spot çiftlerini döner."""
+        """Binance'deki aktif USDC spot çiftlerini döner — stablecoinler hariç."""
+        # Stablecoin base'leri — bunlar USDC karşısında hiçbir zaman trade edilmez
+        stablecoins = {
+            "USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USD1",
+            "USDD", "UST", "USDP", "GUSD", "HUSD", "SUSD", "EURC",
+            "PYUSD", "FRAX", "LUSD", "MIM", "CRVUSD", "USDE",
+        }
         try:
             markets = self._exchange.exchange.load_markets()
             return [
@@ -391,6 +397,7 @@ class Screener:
                     market.get("quote") == "USDC"
                     and market.get("active", False)
                     and market.get("spot", False)
+                    and market.get("base") not in stablecoins
                 )
             ]
         except Exception as exc:
