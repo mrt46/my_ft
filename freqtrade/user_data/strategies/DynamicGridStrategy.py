@@ -18,6 +18,7 @@ Grid file:             my_ft/data/final_grid.json  (4 directories up)
 
 import json
 import logging
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +29,11 @@ from pandas import DataFrame
 
 from freqtrade.persistence import Trade
 from freqtrade.strategy import IStrategy
+
+# Add project root to path so custom_modules can be imported
+_PROJECT_ROOT = Path(__file__).parents[3]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +147,11 @@ class DynamicGridStrategy(IStrategy):
 
     # Track startup notification (sent once per bot start)
     _startup_notified: bool = False
+
+    # Sentiment analysis: last run timestamp (0 = never run)
+    # Runs every 4 hours automatically via bot_loop_start
+    _sentiment_last_run: float = 0.0
+    _SENTIMENT_INTERVAL: float = 4 * 3600.0  # 4 hours in seconds
 
     # -------------------------------------------------------------------------
     # Telegram helpers
@@ -307,6 +318,7 @@ class DynamicGridStrategy(IStrategy):
         Used to:
         - Send one-time startup summary to Telegram
         - Force cache refresh on first run
+        - Trigger sentiment analysis every 4 hours in a background thread
         """
         if not self._startup_notified:
             # Force cache load on first run
@@ -315,6 +327,61 @@ class DynamicGridStrategy(IStrategy):
             if self._cache:
                 self._send_startup_summary()
                 self._startup_notified = True
+
+        # Sentiment analysis: run every 4 hours in a background thread
+        now = time.time()
+        if now - self._sentiment_last_run >= self._SENTIMENT_INTERVAL:
+            self._sentiment_last_run = now  # mark immediately to prevent double-trigger
+            self._run_sentiment_background()
+
+    def _run_sentiment_background(self) -> None:
+        """Launch sentiment analysis in a daemon thread (non-blocking).
+
+        Loads coins from coins.yaml, runs 3-LLM ensemble, saves results to
+        data/sentiment_scores.json and sends Telegram notification.
+        """
+        import threading
+
+        def _worker() -> None:
+            try:
+                import yaml as _yaml
+                coins_file = _PROJECT_ROOT / "config" / "coins.yaml"
+                default_coins = ["BTC", "ETH", "BNB", "SOL", "XRP"]
+                coins: list[str] = default_coins
+
+                if coins_file.exists():
+                    cfg = _yaml.safe_load(coins_file.read_text(encoding="utf-8"))
+                    raw = cfg.get("grid_coins", default_coins)
+                    coins = [c.split("/")[0] for c in raw]
+
+                logger.info("[SENTIMENT] Starting background analysis for: %s", coins)
+                from custom_modules.sentiment_analyzer import SentimentAnalyzer
+                analyzer = SentimentAnalyzer()
+                results = analyzer.get_all_sentiment_with_news_fetch_sync(coins, hours=24)
+
+                # Log summary
+                for coin, r in results.items():
+                    logger.info(
+                        "[SENTIMENT] %s: %+.3f (conf=%.2f, usable=%s)",
+                        coin, r.get("sentiment", 0.0), r.get("confidence", 0.0), r.get("usable")
+                    )
+
+                # Notify via dp.send_msg as well (in addition to direct Telegram)
+                usable = [(c, r) for c, r in results.items() if r.get("usable")]
+                if usable:
+                    lines = ["SENTIMENT OZETI (4h)"]
+                    for coin, r in sorted(usable, key=lambda x: x[1]["sentiment"], reverse=True):
+                        s = r["sentiment"]
+                        emoji = "+" if s > 0.1 else ("-" if s < -0.1 else "=")
+                        lines.append(f"[{emoji}] {coin}: {s:+.3f} (conf={r['confidence']:.2f})")
+                    self._dp_send("\n".join(lines), always_send=True)
+
+            except Exception as exc:
+                logger.error("[SENTIMENT] Background analysis failed: %s", exc)
+
+        t = threading.Thread(target=_worker, daemon=True, name="sentiment-bg")
+        t.start()
+        logger.info("[SENTIMENT] Background thread started")
 
     # -------------------------------------------------------------------------
     # Indicators

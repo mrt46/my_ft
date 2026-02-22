@@ -690,19 +690,19 @@ class SentimentAnalyzer:
         try:
             import aiohttp
             url = f"https://api.telegram.org/bot{self._tg_token}/sendMessage"
+            # Do NOT send parse_mode — plain text avoids all Markdown escaping issues
             payload = {
                 "chat_id": self._tg_chat_id,
                 "text": message,
-                "parse_mode": "",  # plain text — no markdown parsing
             }
-            timeout = aiohttp.ClientTimeout(total=10)
+            timeout = aiohttp.ClientTimeout(total=15)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=payload) as resp:
                     if resp.status != 200:
                         body = await resp.text()
-                        logger.warning("[TG] Telegram send failed: HTTP %d — %s", resp.status, body[:100])
+                        logger.warning("[TG] Telegram send failed: HTTP %d — %s", resp.status, body[:200])
                     else:
-                        logger.debug("[TG] Sentiment notification sent")
+                        logger.info("[TG] Sentiment notification sent for message len=%d", len(message))
         except Exception as exc:
             logger.warning("[TG] Failed to send sentiment to Telegram: %s", exc)
 

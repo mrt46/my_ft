@@ -314,6 +314,8 @@ class Telegram(RPCHandler):
             CommandHandler("screener", self._cmd_screener),
             CommandHandler(["sat", "sell"], self._cmd_sat),
             CommandHandler("report", self._cmd_report),
+            CommandHandler("sentiment", self._cmd_sentiment),
+            CommandHandler("sentiment_run", self._cmd_sentiment_run),
         ]
         callbacks = [
             CallbackQueryHandler(self._status_table, pattern="update_status_table"),
@@ -1998,6 +2000,8 @@ class Telegram(RPCHandler):
             "*/screener:* `Son screener sonuclarini goster`\n"
             "*/sat <PAIR> [market]:* `Manuel satis. Ornek: /sat BTC market`\n"
             "*/report:* `Tam durum raporu: pozisyonlar, P&L, grid ozeti`\n"
+            "*/sentiment [COIN]:* `Son sentiment skorlarini goster. Ornek: /sentiment BTC`\n"
+            "*/sentiment\\_run [COIN]:* `Yeni sentiment analizi baslat (1-2 dk). Ornek: /sentiment\\_run`\n"
         )
 
         await self._send_msg(message, parse_mode=ParseMode.MARKDOWN)
@@ -2325,6 +2329,259 @@ class Telegram(RPCHandler):
         except Exception as exc:
             logger.error("_cmd_report error: %s", exc)
             await self._send_msg(f"*Rapor hatasi:* `{exc}`", parse_mode=ParseMode.MARKDOWN)
+
+    @authorized_only
+    async def _cmd_sentiment(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /sentiment [COIN]
+        Shows last saved sentiment scores from data/sentiment_scores.json.
+        Usage:
+            /sentiment        — shows all coins summary
+            /sentiment BTC    — shows detailed BTC sentiment
+        """
+        import json as _json
+        from pathlib import Path as _Path
+
+        sentiment_file = _Path(__file__).parents[4] / "data" / "sentiment_scores.json"
+        args = context.args or []
+        target_coin = args[0].upper() if args else None
+
+        try:
+            if not sentiment_file.exists():
+                await self._send_msg(
+                    "*Sentiment:* `sentiment_scores.json bulunamadi.`\n"
+                    "Analiz baslatmak icin: /sentiment\\_run",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+
+            data: dict = _json.loads(sentiment_file.read_text(encoding="utf-8"))
+            if not data:
+                await self._send_msg(
+                    "*Sentiment:* `Veri bos. /sentiment\\_run ile analiz calistirin.`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+
+            def _emoji(score: float) -> str:
+                if score >= 0.6:   return "🟢🟢"
+                elif score >= 0.3: return "🟢"
+                elif score >= 0.1: return "🟡"
+                elif score > -0.1: return "⚪"
+                elif score > -0.3: return "🟠"
+                elif score > -0.6: return "🔴"
+                else:              return "🔴🔴"
+
+            if target_coin:
+                # Detailed view for one coin
+                if target_coin not in data:
+                    available = ", ".join(data.keys())
+                    await self._send_msg(
+                        f"*Sentiment:* `{target_coin} bulunamadi.`\n"
+                        f"Mevcut: `{available}`",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                    return
+
+                r = data[target_coin]
+                score = r.get("sentiment", 0.0)
+                conf = r.get("confidence", 0.0)
+                agree = r.get("agreement", 0.0)
+                usable = r.get("usable", False)
+                news_count = r.get("news_count", 0)
+                prompt_ver = r.get("prompt_version", "v1")
+                ts = r.get("timestamp", 0)
+                ts_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M UTC") if ts else "?"
+                individual = r.get("individual_scores", {})
+
+                emoji = _emoji(score)
+                usable_tag = "KULLANILABILIR" if usable else "DUSUK GUVEN"
+
+                lines = [
+                    f"*{emoji} SENTIMENT: {target_coin}*",
+                    f"```",
+                    f"Skor    : {score:+.3f}  [{usable_tag}]",
+                    f"Guven   : {conf:.2f}  Uzlasma: {agree:.2f}",
+                    f"Haberler: {news_count} adet  Prompt: {prompt_ver}",
+                    f"Guncelleme: {ts_str}",
+                    f"",
+                    f"LLM Skorlari:",
+                ]
+                for provider, sc in individual.items():
+                    s = sc.get("sentiment", 0.0) if isinstance(sc, dict) else 0.0
+                    c = sc.get("confidence", 0.0) if isinstance(sc, dict) else 0.0
+                    lines.append(f"  {provider:8s}: {s:+.2f} (conf={c:.2f})")
+
+                # Key events
+                for sc in individual.values():
+                    if isinstance(sc, dict) and sc.get("key_events"):
+                        lines.append("")
+                        lines.append("Onemli Olaylar:")
+                        for ev in sc["key_events"][:3]:
+                            lines.append(f"  + {str(ev)[:80]}")
+                        break
+
+                # Risk factors
+                for sc in individual.values():
+                    if isinstance(sc, dict) and sc.get("risk_factors"):
+                        lines.append("")
+                        lines.append("Risk Faktorleri:")
+                        for rf in sc["risk_factors"][:2]:
+                            lines.append(f"  - {str(rf)[:80]}")
+                        break
+
+                # Reasoning
+                for sc in individual.values():
+                    reasoning = sc.get("reasoning", "") if isinstance(sc, dict) else ""
+                    if reasoning:
+                        lines.append("")
+                        lines.append(f"Analiz:")
+                        # Split long reasoning into 80-char lines
+                        for i in range(0, min(len(reasoning), 240), 80):
+                            lines.append(f"  {reasoning[i:i+80]}")
+                        break
+
+                lines.append("```")
+                await self._send_msg("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+            else:
+                # Summary view for all coins
+                sorted_items = sorted(
+                    data.items(),
+                    key=lambda x: x[1].get("sentiment", 0.0) if isinstance(x[1], dict) else 0.0,
+                    reverse=True,
+                )
+
+                lines = ["*SENTIMENT OZETI*", "```"]
+                usable_scores = []
+                for coin, r in sorted_items:
+                    if not isinstance(r, dict):
+                        continue
+                    score = r.get("sentiment", 0.0)
+                    conf = r.get("confidence", 0.0)
+                    usable = r.get("usable", False)
+                    ts = r.get("timestamp", 0)
+                    age_min = int((datetime.now().timestamp() - ts) / 60) if ts else 0
+                    emoji = _emoji(score)
+                    tag = "ok" if usable else "!"
+                    lines.append(
+                        f"{emoji} {coin:5s}: {score:+.3f}  conf={conf:.2f}  [{tag}]  {age_min}dk once"
+                    )
+                    if usable:
+                        usable_scores.append(score)
+
+                if usable_scores:
+                    avg = sum(usable_scores) / len(usable_scores)
+                    lines.append("")
+                    lines.append(f"Genel Piyasa: {_emoji(avg)} {avg:+.3f}")
+
+                lines.append("")
+                lines.append("Detay icin: /sentiment BTC")
+                lines.append("Yenile icin: /sentiment_run")
+                lines.append("```")
+                await self._send_msg("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+        except Exception as exc:
+            logger.error("_cmd_sentiment error: %s", exc)
+            await self._send_msg(f"*Sentiment hatasi:* `{exc}`", parse_mode=ParseMode.MARKDOWN)
+
+    @authorized_only
+    async def _cmd_sentiment_run(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /sentiment_run [COIN]
+        Triggers a fresh sentiment analysis run.
+        Usage:
+            /sentiment_run          — analyze all 5 grid coins
+            /sentiment_run BTC      — analyze only BTC
+        """
+        import sys as _sys
+        from pathlib import Path as _Path
+
+        args = context.args or []
+        target_coin = args[0].upper() if args else None
+
+        # Determine coins to analyze
+        coins_file = _Path(__file__).parents[4] / "config" / "coins.yaml"
+        default_coins = ["BTC", "ETH", "BNB", "SOL", "XRP"]
+        coins_to_analyze: list[str] = []
+
+        try:
+            import yaml as _yaml
+            if coins_file.exists():
+                cfg = _yaml.safe_load(coins_file.read_text(encoding="utf-8"))
+                raw = cfg.get("grid_coins", default_coins)
+                # Strip /USDC suffix
+                coins_to_analyze = [c.split("/")[0] for c in raw]
+        except Exception:
+            coins_to_analyze = default_coins
+
+        if target_coin:
+            coins_to_analyze = [target_coin]
+
+        coin_list = ", ".join(coins_to_analyze)
+        await self._send_msg(
+            f"*Sentiment analizi baslatiliyor...*\n`Coinler: {coin_list}`\n_Bu 1-2 dakika surebilir._",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+        try:
+            # Add custom_modules to path
+            project_root = _Path(__file__).parents[4]
+            if str(project_root) not in _sys.path:
+                _sys.path.insert(0, str(project_root))
+
+            from custom_modules.sentiment_analyzer import SentimentAnalyzer
+
+            analyzer = SentimentAnalyzer()
+
+            # Run in thread to avoid blocking the bot loop
+            import asyncio as _asyncio
+
+            def _run_analysis() -> dict:
+                return analyzer.get_all_sentiment_with_news_fetch_sync(
+                    coins_to_analyze, hours=24
+                )
+
+            results = await _asyncio.to_thread(_run_analysis)
+
+            # Build result summary
+            def _emoji(score: float) -> str:
+                if score >= 0.6:   return "🟢🟢"
+                elif score >= 0.3: return "🟢"
+                elif score >= 0.1: return "🟡"
+                elif score > -0.1: return "⚪"
+                elif score > -0.3: return "🟠"
+                elif score > -0.6: return "🔴"
+                else:              return "🔴🔴"
+
+            lines = [f"*SENTIMENT ANALIZ TAMAMLANDI*", "```"]
+            for coin, r in sorted(results.items(), key=lambda x: x[1].get("sentiment", 0.0), reverse=True):
+                score = r.get("sentiment", 0.0)
+                conf = r.get("confidence", 0.0)
+                usable = r.get("usable", False)
+                news_count = r.get("news_count", 0)
+                tag = "ok" if usable else "!"
+                lines.append(
+                    f"{_emoji(score)} {coin:5s}: {score:+.3f}  conf={conf:.2f}  "
+                    f"haber={news_count}  [{tag}]"
+                )
+
+            usable_scores = [r.get("sentiment", 0.0) for r in results.values() if r.get("usable")]
+            if usable_scores:
+                avg = sum(usable_scores) / len(usable_scores)
+                lines.append("")
+                lines.append(f"Genel Piyasa: {_emoji(avg)} {avg:+.3f}")
+
+            lines.append("```")
+            lines.append("_Detay icin: /sentiment BTC_")
+            await self._send_msg("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+        except Exception as exc:
+            logger.error("_cmd_sentiment_run error: %s", exc)
+            await self._send_msg(
+                f"*Sentiment analizi basarisiz:* `{exc}`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
 
     @authorized_only
     async def _health(self, update: Update, context: CallbackContext) -> None:
