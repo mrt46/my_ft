@@ -33,12 +33,62 @@ logger = logging.getLogger(__name__)
 
 # Path: strategies/ → user_data/ → freqtrade/ → my_ft/ → data/final_grid.json
 FINAL_GRID_FILE = Path(__file__).parents[3] / "data" / "final_grid.json"
+COINS_FILE = Path(__file__).parents[3] / "config" / "coins.yaml"
 
 # How close (%) to a grid level triggers a signal
 PROXIMITY_PCT = 0.005  # 0.5%
 
 # Minimum profit before grid TP exit is considered (1% — aligned with 3% daily target)
 MIN_PROFIT_FOR_EXIT = 0.01
+
+# Stablecoin / wrapped token patterns to block at strategy level (regex)
+import re as _re
+_STABLECOIN_PATTERNS = [
+    _re.compile(r"^USD\d*/", _re.IGNORECASE),   # USD1, USD2, ...
+    _re.compile(r"^USDT/", _re.IGNORECASE),
+    _re.compile(r"^BUSD/", _re.IGNORECASE),
+    _re.compile(r"^TUSD/", _re.IGNORECASE),
+    _re.compile(r"^FDUSD/", _re.IGNORECASE),
+    _re.compile(r"^DAI/", _re.IGNORECASE),
+    _re.compile(r"^FRAX/", _re.IGNORECASE),
+    _re.compile(r"^LUSD/", _re.IGNORECASE),
+    _re.compile(r"^GUSD/", _re.IGNORECASE),
+    _re.compile(r"^USDD/", _re.IGNORECASE),
+    _re.compile(r"^USDN/", _re.IGNORECASE),
+    _re.compile(r"^USDE/", _re.IGNORECASE),
+    _re.compile(r"WBTC|WETH|WBNB|STETH|BETH|RETH|CBETH", _re.IGNORECASE),
+    _re.compile(r"^PAXG/|^XAUT/", _re.IGNORECASE),
+]
+
+
+def _is_stablecoin_or_wrapped(pair: str) -> bool:
+    """Return True if pair is a stablecoin, pegged asset, or wrapped token."""
+    return any(p.search(pair) for p in _STABLECOIN_PATTERNS)
+
+
+def _load_allowed_pairs() -> set[str]:
+    """Load the allowed whitelist from config/coins.yaml.
+
+    Returns the union of grid_coins + all_grid_coins.
+    Falls back to the hardcoded 5 coins if file is missing.
+    """
+    fallback = {"BTC/USDC", "ETH/USDC", "BNB/USDC", "SOL/USDC", "XRP/USDC"}
+    try:
+        import yaml as _yaml
+        if COINS_FILE.exists():
+            with open(COINS_FILE, encoding="utf-8") as fh:
+                cfg = _yaml.safe_load(fh)
+            pairs: set[str] = set()
+            for key in ("grid_coins", "all_grid_coins"):
+                pairs.update(cfg.get(key, []))
+            return pairs if pairs else fallback
+    except Exception:
+        pass
+    return fallback
+
+
+# Module-level allowed pairs (loaded once at import time)
+_ALLOWED_PAIRS: set[str] = _load_allowed_pairs()
 
 
 class DynamicGridStrategy(IStrategy):
@@ -273,6 +323,14 @@ class DynamicGridStrategy(IStrategy):
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """Mark candles where price is at a grid support level."""
         pair = metadata["pair"]
+
+        # Hard block: stablecoins, wrapped tokens, and non-whitelisted pairs
+        if _is_stablecoin_or_wrapped(pair) or pair not in _ALLOWED_PAIRS:
+            logger.warning("[GUARD] Blocked pair: %s — not in allowed list", pair)
+            dataframe["near_support"] = 0
+            dataframe["grid_support"] = np.nan
+            return dataframe
+
         levels = self._levels(pair)
 
         if not levels:
@@ -309,6 +367,15 @@ class DynamicGridStrategy(IStrategy):
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """Enter long when price touches a grid support level."""
+        pair = metadata["pair"]
+
+        # Hard block: stablecoins, wrapped tokens, and non-whitelisted pairs
+        if _is_stablecoin_or_wrapped(pair) or pair not in _ALLOWED_PAIRS:
+            logger.warning("[GUARD] Entry blocked for pair: %s", pair)
+            dataframe["enter_long"] = 0
+            dataframe["enter_tag"] = ""
+            return dataframe
+
         dataframe.loc[
             (dataframe["near_support"] == 1) & (dataframe["volume"] > 0),
             ["enter_long", "enter_tag"],
@@ -339,6 +406,12 @@ class DynamicGridStrategy(IStrategy):
         minimal_roi {"0": 0.03} acts as safety net if grid TP is not triggered.
         Sends detailed Telegram notification on TP exit.
         """
+        # Hard block: stablecoins and non-whitelisted pairs should never have open trades
+        # but guard here as a safety net
+        if _is_stablecoin_or_wrapped(pair) or pair not in _ALLOWED_PAIRS:
+            logger.warning("[GUARD] Force-exit blocked pair: %s — selling immediately", pair)
+            return "blocked_pair_force_exit"
+
         # Noise filter: ignore tiny moves (aligned with %3 daily target)
         if current_profit < MIN_PROFIT_FOR_EXIT:
             return None
@@ -409,6 +482,11 @@ class DynamicGridStrategy(IStrategy):
         below the average entry, where N = number of DCA entries so far.
         Sends Telegram notification on each DCA trigger.
         """
+        # Hard block: stablecoins and non-whitelisted pairs
+        if _is_stablecoin_or_wrapped(trade.pair) or trade.pair not in _ALLOWED_PAIRS:
+            logger.warning("[GUARD] DCA blocked for pair: %s", trade.pair)
+            return None
+
         levels = self._levels(trade.pair)
         if not levels:
             return None

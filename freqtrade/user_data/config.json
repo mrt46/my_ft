@@ -45,12 +45,59 @@
         ],
         "pair_blacklist": [
             "BNB/BTC",
-            "BNB/ETH"
+            "BNB/ETH",
+            "USD1/USDC",
+            "USDT/USDC",
+            "USDC/USDT",
+            "BUSD/USDC",
+            "TUSD/USDC",
+            "FDUSD/USDC",
+            "DAI/USDC",
+            "USDP/USDC",
+            "USDD/USDC",
+            "FRAX/USDC",
+            "LUSD/USDC",
+            "SUSD/USDC",
+            "GUSD/USDC",
+            "HUSD/USDC",
+            "CUSD/USDC",
+            "MUSD/USDC",
+            "ZUSD/USDC",
+            "USDX/USDC",
+            "USDN/USDC",
+            "USDK/USDC",
+            "USDJ/USDC",
+            "USDI/USDC",
+            "USDH/USDC",
+            "USDG/USDC",
+            "USDF/USDC",
+            "USDE/USDC",
+            "USDB/USDC",
+            "USDA/USDC",
+            "USD.*/USDC",
+            ".*USD/USDC",
+            ".*USDT/USDC",
+            ".*USDC/USDC",
+            ".*BUSD/USDC",
+            ".*DAI/USDC",
+            "PAXG/USDC",
+            "XAUT/USDC",
+            "WBTC/USDC",
+            "WETH/USDC",
+            "WBNB/USDC",
+            "STETH/USDC",
+            "BETH/USDC",
+            "RETH/USDC",
+            "CBETH/USDC"
         ]
     },
     "pairlists": [
         {
             "method": "StaticPairList"
+        },
+        {
+            "method": "PriceFilter",
+            "low_price_ratio": 0.001
         }
     ],
     "telegram": {
