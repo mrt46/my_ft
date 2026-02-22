@@ -55,8 +55,9 @@
     ],
     "telegram": {
         "enabled": true,
-        "token": "",
-        "chat_id": "",
+        "token": "8317637170:AAHzHsX3aCvNH9eGK1aRNDWJe5-7tgpHJNQ",
+        "chat_id": "8351494253",
+        "allow_custom_messages": true,
         "notification_settings": {
             "status": "on",
             "warning": "on",

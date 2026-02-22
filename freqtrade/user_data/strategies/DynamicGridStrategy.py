@@ -16,6 +16,7 @@ Grid file:             my_ft/data/final_grid.json  (4 directories up)
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -76,6 +77,71 @@ class DynamicGridStrategy(IStrategy):
     _cache_ts: float = 0.0
     _CACHE_TTL: float = 300.0  # refresh every 5 minutes
 
+    # Track which pairs we've already sent grid notifications for (avoid spam)
+    _grid_notified: set = set()
+
+    def _send_grid_telegram(self, pair: str, levels: list[float], current_rate: float) -> None:
+        """Send grid levels for a pair to Telegram via Freqtrade's dp.send_msg().
+
+        Called once per pair when grid levels are first loaded.
+        Requires allow_custom_messages: true in config.json telegram section.
+        """
+        try:
+            grid_data = self._cache.get(pair, {})
+            position_size = grid_data.get("position_size", "?")
+            upper = grid_data.get("upper_bound", levels[-1] if levels else 0)
+            lower = grid_data.get("lower_bound", levels[0] if levels else 0)
+            sentiment_score = grid_data.get("sentiment_score", None)
+            spacing = grid_data.get("spacing", "?")
+
+            # Find nearest support and resistance relative to current price
+            below = [lv for lv in levels if lv <= current_rate]
+            above = [lv for lv in levels if lv > current_rate]
+            nearest_support = max(below) if below else None
+            nearest_resist = min(above) if above else None
+
+            # Build levels list (mark current price position with arrow)
+            levels_str = ""
+            for lvl in sorted(levels):
+                if nearest_support and abs(lvl - nearest_support) < 0.0001:
+                    levels_str += f"  ▶ ${lvl:,.4f}  ← destek\n"
+                elif nearest_resist and abs(lvl - nearest_resist) < 0.0001:
+                    levels_str += f"  ▶ ${lvl:,.4f}  ← hedef\n"
+                else:
+                    levels_str += f"  • ${lvl:,.4f}\n"
+
+            sentiment_line = ""
+            if sentiment_score is not None:
+                s_emoji = "🟢" if sentiment_score > 0.1 else ("🔴" if sentiment_score < -0.1 else "🟡")
+                sentiment_line = f"\n{s_emoji} Sentiment: {sentiment_score:+.2f}"
+
+            support_line = f"🎯 En yakın destek: ${nearest_support:,.4f}\n" if nearest_support else ""
+            resist_line = f"🎯 En yakın hedef:  ${nearest_resist:,.4f}\n" if nearest_resist else ""
+
+            msg = (
+                f"📊 GRID SEVİYELERİ — {pair}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"💰 Pozisyon: {position_size} USDC\n"
+                f"📈 Üst sınır: ${upper:,.4f}\n"
+                f"📉 Alt sınır: ${lower:,.4f}\n"
+                f"💵 Şu anki fiyat: ${current_rate:,.4f}\n"
+                f"{support_line}"
+                f"{resist_line}"
+                f"📐 Aralık: {spacing}{sentiment_line}\n\n"
+                f"Tüm seviyeler ({len(levels)} adet):\n"
+                f"{levels_str}"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🕐 {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+            )
+
+            if hasattr(self, 'dp') and self.dp:
+                self.dp.send_msg(msg, always_send=True)
+                logger.info("[GRID NOTIFY] Sent grid levels for %s to Telegram", pair)
+            else:
+                logger.warning("[GRID NOTIFY] DataProvider not available, cannot send Telegram")
+        except Exception as exc:
+            logger.error("[GRID NOTIFY] Failed to send grid levels for %s: %s", pair, exc)
+
     def _refresh_cache(self) -> None:
         """Reload final_grid.json if cache is stale."""
         now = time.time()
@@ -83,9 +149,16 @@ class DynamicGridStrategy(IStrategy):
             return
         try:
             if FINAL_GRID_FILE.exists():
+                old_pairs = set(self._cache.keys())
                 self._cache = json.loads(FINAL_GRID_FILE.read_text(encoding="utf-8"))
                 self._cache_ts = now
+                new_pairs = set(self._cache.keys())
                 logger.debug("Grid cache refreshed: %d pairs", len(self._cache))
+                # Reset notifications for pairs whose grid data changed
+                changed = new_pairs - old_pairs
+                if changed:
+                    self._grid_notified -= changed
+                    logger.info("Grid updated for new pairs: %s", changed)
             else:
                 logger.warning("final_grid.json not found at %s", FINAL_GRID_FILE)
         except Exception as exc:
@@ -114,6 +187,12 @@ class DynamicGridStrategy(IStrategy):
             dataframe["near_support"] = 0
             dataframe["grid_support"] = np.nan
             return dataframe
+
+        # Send grid levels to Telegram once per pair (on first load)
+        if pair not in self._grid_notified and len(dataframe) > 0:
+            current_rate = float(dataframe["close"].iloc[-1])
+            self._send_grid_telegram(pair, levels, current_rate)
+            self._grid_notified.add(pair)
 
         arr = np.array(levels, dtype=float)
         close = dataframe["close"].values.astype(float)
