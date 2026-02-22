@@ -441,7 +441,14 @@ class BotOrchestrator:
                 cwd=str(ft_dir),
                 stdout=ft_log,
                 stderr=ft_log,
-                env={**__import__("os").environ, "PYTHONIOENCODING": "utf-8"},
+                env={
+                    **__import__("os").environ,
+                    "PYTHONIOENCODING": "utf-8",
+                    # Freqtrade'in kendi Telegram altyapısına token/chat_id aktar
+                    # (config.json'daki enabled:true ile birlikte çalışır)
+                    "FREQTRADE__telegram__token": __import__("os").environ.get("TELEGRAM_BOT_TOKEN", ""),
+                    "FREQTRADE__telegram__chat_id": __import__("os").environ.get("TELEGRAM_CHAT_ID", ""),
+                },
             )
             logger.info("Freqtrade subprocess started (PID=%d) — log: %s", process.pid, log_file)
             send_alert_sync(f"Freqtrade baslatildi (PID={process.pid})")
@@ -450,6 +457,71 @@ class BotOrchestrator:
             logger.error("Failed to start Freqtrade subprocess: %s", exc)
             send_alert_sync(f"Freqtrade baslatma hatasi: {exc}")
             return None
+
+    async def run_grid_level_notification(self) -> None:
+        """5 dakikada bir grid seviyelerini Telegram'a gönder.
+
+        final_grid.json'dan seviyeleri okur, anlık fiyatı Binance'den çeker
+        ve her coin için 'fiyat nerede, hangi seviye yakın' bilgisi yollar.
+        Strateji zaten 5 dakikada bir final_grid.json'ı yeniden okur (_CACHE_TTL=300s).
+        """
+        try:
+            final_grid_file = Path(__file__).parent / "data" / "final_grid.json"
+            if not final_grid_file.exists():
+                return
+
+            grids: dict = json.loads(final_grid_file.read_text(encoding="utf-8"))
+            if not grids:
+                return
+
+            now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
+            lines = [f"📊 <b>Grid Seviyeleri — {now_str}</b>\n━━━━━━━━━━━━━━━━━━━━━━━"]
+
+            for pair, grid in grids.items():
+                levels: list[float] = sorted(grid.get("levels", []))
+                if not levels:
+                    continue
+
+                try:
+                    ticker = await asyncio.to_thread(
+                        self.exchange._exchange.fetch_ticker, pair
+                    )
+                    price: float = float(ticker.get("last", 0))
+                except Exception:
+                    price = 0.0
+
+                if price > 0:
+                    # En yakın destek (fiyatın altındaki en yüksek seviye)
+                    support = max((l for l in levels if l <= price), default=None)
+                    # En yakın direnç (fiyatın üstündeki en düşük seviye)
+                    resistance = min((l for l in levels if l > price), default=None)
+
+                    sup_str = f"${support:,.4f}" if support else "—"
+                    res_str = f"${resistance:,.4f}" if resistance else "—"
+
+                    pct_to_sup = ((price - support) / support * 100) if support else 0
+                    pct_to_res = ((resistance - price) / price * 100) if resistance else 0
+
+                    sup_tag = f" ({pct_to_sup:+.1f}%)" if support else ""
+                    res_tag = f" ({pct_to_res:+.1f}%)" if resistance else ""
+
+                    lines.append(
+                        f"\n<b>{pair}</b> → ${price:,.4f}\n"
+                        f"  🟢 Destek: {sup_str}{sup_tag}\n"
+                        f"  🔴 Direnç: {res_str}{res_tag}\n"
+                        f"  Seviye: {len(levels)} adet"
+                    )
+                else:
+                    lines.append(
+                        f"\n<b>{pair}</b> — fiyat alınamadı\n"
+                        f"  Seviyeler: {', '.join(f'${l:,.2f}' for l in levels[:4])}"
+                    )
+
+            send_alert_sync("\n".join(lines))
+            logger.debug("Grid level notification sent for %d pairs", len(grids))
+
+        except Exception as exc:
+            logger.warning("Grid level notification failed: %s", exc)
 
     async def _send_startup_grid_notification(self) -> None:
         """Send grid levels for each coin to Telegram on startup."""
@@ -559,16 +631,18 @@ class BotOrchestrator:
 
         # Scheduler loop
         last_grid = 0.0
-        last_screener = -999999.0  # Force immediate screener on startup
+        last_grid_notify = 0.0           # 5 dk grid seviye bildirimi
+        last_screener = -999999.0        # Force immediate screener on startup
         last_ema = 0.0
         last_health = 0.0
         last_report = 0.0
 
-        GRID_INTERVAL = 2 * 3600        # 2 hours
-        SCREENER_INTERVAL = 1 * 3600    # 1 hour (changed from 24h)
-        EMA_INTERVAL = 1 * 3600         # 1 hour (changed from 4h)
-        HEALTH_INTERVAL = 30            # 30 seconds
-        REPORT_INTERVAL = 24 * 3600     # 24 hours
+        GRID_INTERVAL = 2 * 3600        # 2 saat — tam analiz (S/R + sentiment)
+        GRID_NOTIFY_INTERVAL = 5 * 60   # 5 dakika — anlık fiyat vs seviye bildirimi
+        SCREENER_INTERVAL = 1 * 3600    # 1 saat
+        EMA_INTERVAL = 1 * 3600         # 1 saat
+        HEALTH_INTERVAL = 30            # 30 saniye
+        REPORT_INTERVAL = 24 * 3600     # 24 saat
 
         try:
             while True:
@@ -592,6 +666,11 @@ class BotOrchestrator:
                 if now - last_grid >= GRID_INTERVAL:
                     await self.run_grid_analysis()
                     last_grid = now
+
+                # 5 dakikada bir: anlık fiyat vs grid seviyeleri → Telegram
+                if now - last_grid_notify >= GRID_NOTIFY_INTERVAL:
+                    await self.run_grid_level_notification()
+                    last_grid_notify = now
 
                 if now - last_ema >= EMA_INTERVAL:
                     await self.run_ema_update()

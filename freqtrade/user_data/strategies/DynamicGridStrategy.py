@@ -52,11 +52,12 @@ class DynamicGridStrategy(IStrategy):
     position_adjustment_enable = True
     max_entry_position_adjustment = 8  # max 9 total entries per pair
 
-    # Backup ROI — custom_exit handles grid take-profits primarily
+    # Target ROI — 3% per trade (daily_profit_target_pct: 3.0 in settings.yaml)
+    # custom_exit handles grid take-profits; minimal_roi is the safety net
     minimal_roi = {
-        "0": 0.20,      # 20% at any time
-        "2880": 0.10,   # 10% after 2 days
-        "7200": 0.05,   # 5% after 5 days
+        "0": 0.03,      # 3% — günlük kar hedefi
+        "1440": 0.02,   # 2% — 1 günden sonra
+        "2880": 0.01,   # 1% — 2 günden sonra
     }
 
     # Fallback stop-loss (below lowest expected grid level)

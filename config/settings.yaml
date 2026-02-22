@@ -27,6 +27,8 @@ grid:
   sr_merge_threshold_pct: 0.3     # Yakın S/R seviyelerini birleştir
   sr_price_bin_pct: 0.5           # Volume profil bin büyüklüğü (fiyatın %'si, 0.5 = %0.5)
   sr_wick_multiplier: 2.0         # Rejection wick eşiği
+  daily_profit_target_pct: 3.0    # Günlük kar hedefi (%3)
+  notify_interval_minutes: 5      # Telegram grid seviye bildirimi sıklığı
 
 # --- Screener ---
 screener:
