@@ -134,13 +134,13 @@ class GridAnalyzer:
 
         current_price = float(df["close"].iloc[-1])
 
-        # Tier-based grid levels
-        if rank < 3:
-            target_levels = 10  # Tier 1: Large Cap
-        elif rank < 6:
-            target_levels = 8   # Tier 2: Mid Cap
+        # Tier-based grid levels (5-coin system)
+        if rank <= 1:
+            target_levels = 10  # Tier 1: ilk 2 coin (BTC, ETH)
+        elif rank <= 3:
+            target_levels = 8   # Tier 2: 3-4. coin (BNB, SOL)
         else:
-            target_levels = 6   # Tier 3: Small Cap
+            target_levels = 6   # Tier 3: 5. coin (XRP)
 
         # Adjust based on volatility (ATR)
         try:
@@ -176,18 +176,16 @@ class GridAnalyzer:
         return config
 
     def analyze_all(self) -> dict[str, GridConfig]:
-        """Analyse all coins defined in ``config/coins.yaml``.
+        """Analyse all fixed grid coins from coins.yaml (grid_coins list).
 
         Returns:
-            Mapping of pair → GridConfig.
+            Mapping of pair → GridConfig with tier-based settings.
         """
         results: dict[str, GridConfig] = {}
-        all_coins: list[str] = self._coins_cfg.get("all_grid_coins", [])
-        # Filter stablecoins
-        all_coins = [p for p in all_coins if p.split("/")[0] not in self.STABLECOINS]
-        for pair in all_coins:
+        coins = self.get_grid_coins()
+        for rank, pair in enumerate(coins):
             try:
-                results[pair] = self.analyze(pair)
+                results[pair] = self.analyze(pair, rank=rank)
             except Exception as exc:
                 logger.error(f"Grid analysis failed for {pair}: {exc}")
         return results
@@ -196,18 +194,38 @@ class GridAnalyzer:
     # Dynamic top volume pairs
     # ------------------------------------------------------------------
 
-    def get_top_volume_pairs(self, top_n: int = 10, min_volume_24h: float = 10_000_000) -> list[str]:
-        """Get top N USDC pairs by 24h trading volume from Binance.
-
-        Filters out stablecoins and only returns actual trading pairs.
-
-        Args:
-            top_n: Number of pairs to return (default 10)
-            min_volume_24h: Minimum 24h volume in USDC (default 10M)
+    def get_grid_coins(self) -> list[str]:
+        """Return the fixed grid coin list from coins.yaml (grid_coins key).
 
         Returns:
-            List of pair symbols sorted by volume (descending)
+            Ordered list of USDC pairs; order determines tier assignment.
+            Falls back to all_grid_coins if grid_coins key is missing.
         """
+        coins = self._coins_cfg.get("grid_coins") or self._coins_cfg.get("all_grid_coins", [])
+        filtered = [p for p in coins if p.split("/")[0] not in self.STABLECOINS]
+        logger.info("Fixed grid coins (%d): %s", len(filtered), filtered)
+        return filtered
+
+    def get_top_volume_pairs(self, top_n: int = 5, min_volume_24h: float = 5_000_000) -> list[str]:
+        """Return fixed grid coins from coins.yaml (primary) or dynamic volume list (fallback).
+
+        Uses the fixed list defined in ``config/coins.yaml → grid_coins`` when
+        ``grid.use_fixed_coins: true`` (default). Falls back to dynamic Binance
+        volume ranking only if the fixed list is empty.
+
+        Args:
+            top_n: Maximum pairs to return (ignored when use_fixed_coins=true)
+            min_volume_24h: Minimum 24h volume filter for dynamic fallback
+
+        Returns:
+            List of USDC pairs in tier-priority order (index = rank)
+        """
+        fixed = self.get_grid_coins()
+        if fixed:
+            return fixed[:top_n]
+
+        # Dynamic fallback (when coins.yaml list is empty)
+        logger.warning("grid_coins list empty — falling back to dynamic volume selection")
         try:
             markets = self._exchange.exchange.load_markets()
             usdc_pairs = [
@@ -215,7 +233,7 @@ class GridAnalyzer:
                 if market.get("quote") == "USDC"
                 and market.get("active", False)
                 and market.get("spot", False)
-                and market.get("base") not in self.STABLECOINS  # Exclude stablecoins
+                and market.get("base") not in self.STABLECOINS
             ]
 
             volumes: list[tuple[str, float]] = []
@@ -230,18 +248,13 @@ class GridAnalyzer:
 
             volumes.sort(key=lambda x: x[1], reverse=True)
             top_pairs = [p for p, _ in volumes[:top_n]]
-
-            logger.info(f"Top {len(top_pairs)} volume pairs (stablecoins excluded): {top_pairs}")
+            logger.info("Dynamic top %d pairs: %s", len(top_pairs), top_pairs)
             return top_pairs
 
         except Exception as exc:
-            logger.error(f"Failed to get top volume pairs: {exc}")
-            # Fallback to static list
-            fallback_coins = self._coins_cfg.get("all_grid_coins", [])
-            # Filter stablecoins from fallback too
-            fallback_filtered = [p for p in fallback_coins if p.split("/")[0] not in self.STABLECOINS]
-            logger.info(f"Using fallback list: {fallback_filtered}")
-            return fallback_filtered[:top_n]
+            logger.error("Dynamic pair selection failed: %s", exc)
+            fallback = self._coins_cfg.get("all_grid_coins", [])
+            return [p for p in fallback if p.split("/")[0] not in self.STABLECOINS][:top_n]
 
     def analyze_top_volume_pairs(self, top_n: int = 10) -> dict[str, GridConfig]:
         """Analyze top N volume pairs with tier-based grid levels.

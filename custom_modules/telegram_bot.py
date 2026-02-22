@@ -139,53 +139,60 @@ async def send_screener_proposal(
     """Send an interactive screener proposal with inline keyboard.
 
     Args:
-        candidate: ScreenerCandidate dict.
+        candidate: ScreenerCandidate dict (multi-TF fields supported).
         position_size: Suggested USDC amount.
         on_buy_callback: Coroutine to call when user taps ✅ AL.
         on_reject_callback: Coroutine to call when user taps ❌ REDDET.
-
-    Features:
-        - 24-hour timeout: auto-rejects if no response.
-        - Shows full technical analysis and hybrid exit plan.
     """
     pair = candidate["pair"]
     price = candidate["price"]
-    ema200 = candidate["ema200"]
-    rsi_4h = candidate["rsi_4h"]
-    rsi_1d = candidate["rsi_1d"]
-    dist = candidate["distance_pct"]
     volume = candidate["volume"]
     score = candidate["score"]
 
+    # Multi-TF alanlar (eski 'ema200' alanı da geriye uyumlu çalışır)
+    rsi_1h = candidate.get("rsi_1h", 50.0)
+    rsi_4h = candidate.get("rsi_4h", 50.0)
+    rsi_1d = candidate.get("rsi_1d", 50.0)
+    ema200_1h = candidate.get("ema200_1h", candidate.get("ema200", 0))
+    ema200_4h = candidate.get("ema200_4h", candidate.get("ema200", 0))
+    ema200_1d = candidate.get("ema200_1d", candidate.get("ema200", 0))
+    dist_1h = candidate.get("distance_pct_1h", candidate.get("distance_pct", 0))
+    dist_4h = candidate.get("distance_pct_4h", candidate.get("distance_pct", 0))
+    dist_1d = candidate.get("distance_pct_1d", candidate.get("distance_pct", 0))
+    signal_strength = candidate.get("signal_strength", "—")
+    buy_suggestion = candidate.get("buy_suggestion", "İZLE")
+
+    def _rsi_icon(rsi: float, thr: float) -> str:
+        return "🔴" if rsi < thr else ("🟡" if rsi < thr + 10 else "🟢")
+
     stop = price * 0.95
     ladder = [price * 1.15, price * 1.18, price * 1.20]
-    ema_gain = ((ema200 / price) - 1) * 100
+    ema_gain_1d = ((ema200_1d / price) - 1) * 100 if ema200_1d > 0 else 0.0
 
     msg = (
         f"🔍 <b>YENİ FIRSAT BULUNDU!</b>\n\n"
         f"📌 <b>{pair}</b>\n"
-        f"💰 Önerilen: <b>{position_size} USDC</b>\n\n"
-        f"📊 <b>TEKNİK ANALİZ:</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"• 4h RSI: {rsi_4h:.1f} {'🔴 Oversold' if rsi_4h < 30 else '🟡'}\n"
-        f"• 1D RSI: {rsi_1d:.1f} {'🔴 Oversold' if rsi_1d < 30 else '🟡'}\n"
-        f"• Fiyat: ${price:.6f}\n"
-        f"• EMA200: ${ema200:.6f}\n"
-        f"• Mesafe: {dist:.1f}% altında\n"
-        f"• Volume: ${volume/1_000_000:.1f}M\n\n"
-        f"🎯 <b>STRATEJİ:</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Entry: ${price:.6f} (Market)\n"
-        f"Stop: ${stop:.6f} (-5%)\n\n"
-        f"Exit Plan (Hybrid):\n"
-        f"├─ EMA200 Touch: ${ema200:.6f}\n"
-        f"│  → 40% sat (+{ema_gain:.1f}% kar)\n"
-        f"│\n"
-        f"└─ Kademeli:\n"
-        f"   • 30% @ +15% (${ladder[0]:.6f})\n"
-        f"   • 20% @ +18% (${ladder[1]:.6f})\n"
-        f"   • 10% @ +20% (${ladder[2]:.6f})\n\n"
-        f"⚡ <b>FIRSAT SKORU: {score}/100</b>"
+        f"💰 Önerilen: <b>{position_size:.0f} USDC</b>\n"
+        f"⚡ Sinyal: <b>{signal_strength}</b>  →  <b>{buy_suggestion}</b>\n\n"
+        f"📊 <b>MULTI-TIMEFRAME ANALİZ:</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"1H RSI: {rsi_1h:5.1f} {_rsi_icon(rsi_1h, 40)}  "
+        f"EMA200: ${ema200_1h:.4f}  (-{dist_1h:.1f}%)\n"
+        f"4H RSI: {rsi_4h:5.1f} {_rsi_icon(rsi_4h, 35)}  "
+        f"EMA200: ${ema200_4h:.4f}  (-{dist_4h:.1f}%)\n"
+        f"1D RSI: {rsi_1d:5.1f} {_rsi_icon(rsi_1d, 30)}  "
+        f"EMA200: ${ema200_1d:.4f}  (-{dist_1d:.1f}%)\n\n"
+        f"💵 Fiyat: ${price:.6f}\n"
+        f"📦 Hacim: ${volume/1_000_000:.1f}M USDC\n\n"
+        f"🎯 <b>ÇIKIŞ PLANI (Hybrid):</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Entry : ${price:.6f}\n"
+        f"Stop  : ${stop:.6f}  (-5%)\n\n"
+        f"EMA200(1D) Touch → %40 sat (+{ema_gain_1d:.1f}%)\n"
+        f"• %30 @ +15%  →  ${ladder[0]:.6f}\n"
+        f"• %20 @ +18%  →  ${ladder[1]:.6f}\n"
+        f"• %10 @ +20%  →  ${ladder[2]:.6f}\n\n"
+        f"⚡ <b>FIRSAT SKORU: {score}/120</b>"
     )
 
     keyboard = InlineKeyboardMarkup([

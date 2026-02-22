@@ -1,53 +1,32 @@
 # ============================================================
-# coins.yaml — Grid Trading Coin Allocation
-# Dynamic tier allocation based on 24h volume ranking
+# coins.yaml — Sabit Grid Trading Coin Listesi
+# Bu dosyayı düzenleyerek coin ekleyebilir / çıkarabilirsiniz.
+# Sıralama tier'ı belirler: ilk 2 = Tier 1, 3-4. = Tier 2, 5. = Tier 3
 # ============================================================
 
-# Tier Configuration (automatically applied based on volume rank)
-tier_config:
-  tier_1:
-    name: "Large Cap"
-    allocation_pct: 40        # 40% of grid capital (240 USDC)
-    grid_levels: 10           # 10 grid levels
-    rank_range: [1, 3]        # Top 3 volume pairs
-    description: "Highest volume, most stable"
+grid_coins:
+  - BTC/USDC    # Tier 1 — 120 USDC / 10 seviye (12 USDC/seviye)
+  - ETH/USDC    # Tier 1 — 120 USDC / 10 seviye (12 USDC/seviye)
+  - BNB/USDC    # Tier 2 — 105 USDC /  8 seviye (13 USDC/seviye)
+  - SOL/USDC    # Tier 2 — 105 USDC /  8 seviye (13 USDC/seviye)
+  - XRP/USDC    # Tier 3 — 150 USDC /  6 seviye (25 USDC/seviye)
 
-  tier_2:
-    name: "Mid Cap"
-    allocation_pct: 30        # 30% of grid capital (180 USDC)
-    grid_levels: 8            # 8 grid levels
-    rank_range: [4, 6]        # Rank 4-6 volume pairs
-    description: "Medium volume, moderate volatility"
+# ============================================================
+# Tier bütçe dağılımı (600 USDC grid bütçesi üzerinden):
+#
+#   Tier 1 (rank 0-1, ilk 2 coin) : %40 → 240 USDC toplam
+#                                        120 USDC/coin × 10 seviye
+#   Tier 2 (rank 2-3, 3-4. coin)  : %35 → 210 USDC toplam
+#                                        105 USDC/coin ×  8 seviye
+#   Tier 3 (rank 4,   5. coin)    : %25 → 150 USDC toplam
+#                                        150 USDC/coin ×  6 seviye
+#   Toplam grid bütçesi           : 600 USDC  ✓
+# ============================================================
 
-  tier_3:
-    name: "Small Cap"
-    allocation_pct: 20        # 20% of grid capital (120 USDC)
-    grid_levels: 6            # 6 grid levels
-    rank_range: [7, 10]       # Rank 7-10 volume pairs
-    description: "Lower volume, higher volatility"
-
-# Note: Coins are selected dynamically by 24h volume from Binance
-# The static list below is used as fallback only
-
-# Fallback static list (used if volume fetch fails)
+# Fallback (API erişimi yoksa kullanılır)
 all_grid_coins:
   - BTC/USDC
   - ETH/USDC
-  - SOL/USDC
   - BNB/USDC
+  - SOL/USDC
   - XRP/USDC
-  - ADA/USDC
-  - AVAX/USDC
-  - DOT/USDC
-  - DOGE/USDC
-  - LINK/USDC
-
-# Screener exclusion (grid coins can also appear in screener)
-screener_exclude: []
-
-# Dynamic selection settings
-dynamic_selection:
-  enabled: true
-  top_n: 10                 # Select top 10 by volume
-  min_volume_24h: 10000000  # Minimum 10M USDC 24h volume
-  update_interval_hours: 2  # Refresh every 2 hours with grid analysis
