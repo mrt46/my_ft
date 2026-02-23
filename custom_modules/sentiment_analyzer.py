@@ -150,7 +150,7 @@ class SentimentAnalyzer:
         s = cfg.get("sentiment", {})
         self._timeout: int = s.get("llm_timeout_seconds", 30)
         self._min_confidence: float = s.get("min_confidence", 0.6)
-        self._min_llms: int = s.get("min_llms_required", 2)
+        self._min_llms: int = s.get("min_llms_required", 1)
         self._weights: dict[str, float] = {
             "deepseek": s.get("weight_deepseek", 0.35),
             "gpt4o": s.get("weight_gpt4o", 0.35),
@@ -167,11 +167,24 @@ class SentimentAnalyzer:
         self._tg_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
         self._tg_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
+        # Validate keys at startup — log which providers are available
+        self._available_providers: list[str] = []
+        if self._openai_key:
+            self._available_providers.append("gpt4o")
+        if self._deepseek_key:
+            self._available_providers.append("deepseek")
+        if self._gemini_key:
+            self._available_providers.append("gemini")
+
         logger.info(
-            "SentimentAnalyzer initialised — prompt=%s, timeout=%ds, min_conf=%.1f, tg=%s",
+            "SentimentAnalyzer initialised — prompt=%s, timeout=%ds, min_conf=%.1f, "
+            "providers=%s, tg=%s",
             self._prompt_version, self._timeout, self._min_confidence,
+            self._available_providers,
             "enabled" if self._tg_token else "disabled",
         )
+        if not self._available_providers:
+            logger.error("SentimentAnalyzer: NO API keys configured! Set OPENAI_API_KEY / DEEPSEEK_API_KEY / GEMINI_API_KEY in .env")
 
     # ------------------------------------------------------------------
     # Public API
@@ -347,16 +360,25 @@ class SentimentAnalyzer:
     async def _call_deepseek(self, prompt: str, coin: str) -> LLMScore:
         """Call DeepSeek v3 via OpenAI-compatible API.
 
+        Falls back to OpenAI (gpt-4o-mini) if DeepSeek key is missing or invalid.
+
         Args:
             prompt: Full prompt text.
             coin: Coin being analysed.
 
         Returns:
-            LLMScore from DeepSeek.
+            LLMScore from DeepSeek (or OpenAI fallback).
 
         Raises:
             Exception on timeout or parse error.
         """
+        # Fallback: if no DeepSeek key, use OpenAI with slightly different temperature
+        if not self._deepseek_key:
+            if not self._openai_key:
+                raise ValueError("DeepSeek key missing and no OpenAI fallback available")
+            logger.debug("[SENTIMENT] DeepSeek key missing — using OpenAI fallback for deepseek slot")
+            return await self._call_openai_as(prompt, coin, provider_label="deepseek", temperature=0.2)
+
         import aiohttp
 
         url = "https://api.deepseek.com/v1/chat/completions"
@@ -368,7 +390,7 @@ class SentimentAnalyzer:
             "model": "deepseek-chat",
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1,
-            "max_tokens": 200,
+            "max_tokens": 300,
         }
 
         async with aiohttp.ClientSession() as session:
@@ -379,6 +401,12 @@ class SentimentAnalyzer:
 
         # Handle API-level errors (e.g. invalid key, rate limit, quota)
         if "error" in data:
+            err_msg = data["error"].get("message", str(data["error"])) if isinstance(data["error"], dict) else str(data["error"])
+            # If authentication error, try OpenAI fallback
+            if "authentication" in err_msg.lower() or "invalid" in err_msg.lower():
+                logger.warning("[SENTIMENT] DeepSeek auth failed — falling back to OpenAI for deepseek slot")
+                if self._openai_key:
+                    return await self._call_openai_as(prompt, coin, provider_label="deepseek", temperature=0.2)
             raise ValueError(f"DeepSeek API error: {data['error']}")
         if "choices" not in data or not data["choices"]:
             raise ValueError(f"DeepSeek unexpected response (no choices): {str(data)[:200]}")
@@ -419,16 +447,25 @@ class SentimentAnalyzer:
     async def _call_gemini(self, prompt: str, coin: str) -> LLMScore:
         """Call Gemini 2.0 Flash via Google GenAI API (google-genai package).
 
+        Falls back to OpenAI (gpt-4o-mini) if Gemini key is missing or invalid.
+
         Args:
             prompt: Full prompt text.
             coin: Coin being analysed.
 
         Returns:
-            LLMScore from Gemini.
+            LLMScore from Gemini (or OpenAI fallback).
 
         Raises:
             Exception on timeout or parse error.
         """
+        # Fallback: if no Gemini key, use OpenAI with slightly different temperature
+        if not self._gemini_key:
+            if not self._openai_key:
+                raise ValueError("Gemini key missing and no OpenAI fallback available")
+            logger.debug("[SENTIMENT] Gemini key missing — using OpenAI fallback for gemini slot")
+            return await self._call_openai_as(prompt, coin, provider_label="gemini", temperature=0.3)
+
         from google import genai
         from google.genai import types as genai_types
 
@@ -440,17 +477,60 @@ class SentimentAnalyzer:
                 contents=prompt,
                 config=genai_types.GenerateContentConfig(
                     temperature=0.1,
-                    max_output_tokens=200,
+                    max_output_tokens=300,
                 ),
             )
             return response.text or ""
 
-        content = await asyncio.wait_for(
-            asyncio.to_thread(_sync_call),
-            timeout=self._timeout,
-        )
+        try:
+            content = await asyncio.wait_for(
+                asyncio.to_thread(_sync_call),
+                timeout=self._timeout,
+            )
+        except Exception as exc:
+            err_str = str(exc).lower()
+            # If API key invalid, fall back to OpenAI
+            if "api key not found" in err_str or "invalid_argument" in err_str or "invalid" in err_str:
+                logger.warning("[SENTIMENT] Gemini auth failed — falling back to OpenAI for gemini slot")
+                if self._openai_key:
+                    return await self._call_openai_as(prompt, coin, provider_label="gemini", temperature=0.3)
+            raise
+
         parsed = self._parse_llm_response(content)
         return LLMScore(provider="gemini", **parsed)  # type: ignore[misc]
+
+    async def _call_openai_as(
+        self, prompt: str, coin: str, provider_label: str, temperature: float = 0.1
+    ) -> LLMScore:
+        """Call OpenAI GPT-4o-mini as a stand-in for another provider.
+
+        Used as fallback when DeepSeek or Gemini keys are missing/invalid.
+
+        Args:
+            prompt: Full prompt text.
+            coin: Coin being analysed.
+            provider_label: Label to assign in LLMScore (e.g. 'deepseek', 'gemini').
+            temperature: Slightly different temperature to get diverse outputs.
+
+        Returns:
+            LLMScore labelled as provider_label.
+        """
+        import openai
+
+        client = openai.AsyncOpenAI(api_key=self._openai_key)
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                max_tokens=300,
+            ),
+            timeout=self._timeout,
+        )
+        content = response.choices[0].message.content or ""
+        parsed = self._parse_llm_response(content)
+        logger.debug("[SENTIMENT] OpenAI fallback for %s slot: %s score=%.2f", provider_label, coin, parsed.get("sentiment", 0))
+        return LLMScore(provider=provider_label, **parsed)  # type: ignore[misc]
 
     # ------------------------------------------------------------------
     # Aggregation

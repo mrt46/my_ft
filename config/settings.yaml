@@ -85,7 +85,7 @@ news:
 sentiment:
   llm_timeout_seconds: 30
   min_confidence: 0.6             # Confidence < 0.6 → sentiment ignore
-  min_llms_required: 2            # En az 2 LLM başarılı olmalı
+  min_llms_required: 1            # En az 1 LLM başarılı olmalı (geçersiz key varsa 1 yeterli)
   news_batch_size: 10
   news_hours: 24                  # Kaç saatlik haberleri analiz et
   prompt_version: "v2"            # "v1" (temel) veya "v2" (gelişmiş, önerilen)
